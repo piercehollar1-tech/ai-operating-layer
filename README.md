@@ -1,44 +1,73 @@
 # Personal AI Operating Layer
 
-A persistent memory and skill-orchestration system I built on top of [Claude Code](https://claude.com/claude-code), my primary AI development environment. It's the setup I use every day to do real automation work — and a running experiment in making an AI assistant accumulate knowledge and handle repeatable, multi-step work reliably.
+A sanitized reference architecture for giving multiple AI coding clients durable, shared context without publishing the private system that inspired it.
 
-> This repository documents the system at a conceptual level. It's a personal environment, so the live configuration isn't published here.
+This repository shows the relationships between instruction files, memory, long-form notes, reusable workflows, and client-specific automation. Every included file uses fictional data or placeholders. It does **not** contain a live `CLAUDE.md`, `AGENTS.md`, memory store, vault, credential, hook configuration, or personal absolute path.
 
-## Why I built it
+## The core idea
 
-Out of the box, an AI assistant forgets everything between sessions and treats every task the same way. I wanted mine to **carry context across days** and to **run repeatable workflows without me re-explaining them each time.** So I built two systems and wired them into my daily environment.
+Treat each AI client as a stateless reader and writer around one private, filesystem-backed context layer:
 
-## 1. File-based memory
+```mermaid
+flowchart LR
+    U[User request] --> C[Claude Code adapter]
+    U --> X[Codex adapter]
+    C --> S[Private shared context root]
+    X --> S
+    S --> T[Current focus]
+    S --> M[Concise memory index]
+    S --> V[Long-form vault]
+    S --> K[Reusable skills]
+    C --> CH[Claude-specific settings and hooks]
+    X --> XH[Codex-specific config and hooks]
+```
 
-A memory layer where each fact, project, preference, or lesson is its own small file with structured metadata, indexed so the relevant ones surface automatically at the start of every session.
+The shared files are the source of truth. `CLAUDE.md` and `AGENTS.md` are thin adapters: they tell each client where the shared context lives, when to retrieve it, and how to save durable knowledge. Client-specific settings, permissions, and hooks stay client-specific.
 
-- Remembers ongoing projects, past mistakes, and working preferences
-- Gets *more* useful over time instead of resetting each session
-- A learning protocol captures every correction or non-obvious fix as a durable lesson rather than losing it
+## What this reference includes
 
-## 2. Staged, review-gated skill pipeline
+- [Architecture](docs/architecture.md): component boundaries, pointer map, retrieval flow, and persistence model
+- [Setup guide](docs/setup.md): a safe manual rollout for Claude Code, Codex, or both
+- [Bootstrap prompt](reference/BOOTSTRAP_PROMPT.md): instructions you can hand to an AI client to adapt the blueprint without overwriting existing configuration
+- [Reference tree](reference/README.md): dummy adapters, memory, vault notes, and a review-gated workflow skill
 
-A workflow system for repeatable, multi-step jobs — things like client onboarding or research-to-report — where work moves through **numbered stages with a human checkpoint between each**, so nothing ships unreviewed.
+## Design principles
 
-- Each stage declares exactly what context to load
-- Human review gates between stages keep the process interpretable and safe
-- Adapted from patterns circulating in the open-source Claude Code community, integrated and tuned to my own workflows
+1. **One brain, many clients.** Durable knowledge lives in shared files, not in a model-specific conversation history.
+2. **Retrieve on demand.** Start with the request and repository guidance. Load personal context only when the task needs it.
+3. **Keep the hot index small.** A concise `MEMORY.md` points to focused topic files; long-form material belongs in the vault.
+4. **Separate knowledge from procedure.** Memory records facts and decisions. Skills describe repeatable workflows.
+5. **Separate shared state from client mechanics.** Hooks, permissions, plugins, and tool configuration do not automatically port between clients.
+6. **Review governance changes.** Do not silently rewrite global instructions, shared skills, or memory conventions.
+7. **Verify consumption, not existence.** A file on disk is not proof that a client loaded or followed it.
 
-## What I actually learned: distrust silent success
+## What changed from the original project description
 
-Early on, I added components that *looked* installed but had silently never loaded — because I'd verified the files existed instead of verifying the system consumed them. For days I relied on capabilities that weren't actually running.
+The first version documented a Claude-only memory and skill system at a high level. The current reference reflects a more mature design:
 
-That reshaped how I work. I now treat **"it exists" and "it works" as separate claims**, and I only allow myself to assert the second one. After any install or config change, I confirm the system actually picked it up — listing what loaded and testing the real symptom, not the artifact. That single discipline has since caught dead integrations and a misconfigured deploy gate before they caused damage.
+- Claude Code and Codex can share the same private filesystem stores.
+- Retrieval is narrow and task-driven rather than a ritual bulk-load at every session.
+- Long-form notes and concise operational memory have separate jobs.
+- Semantic or hybrid recall is optional infrastructure, not a required daemon.
+- Historical conversation archives, if retained, are read-only sources rather than the live memory system.
+- No background memory service is required for the architecture to work.
 
-A visible error is a gift; a silent one costs you days.
+## Security boundary
 
-## Stack
+Keep the real context root private. Before publishing any derivative:
 
-- **Environment:** Claude Code
-- **Memory:** structured Markdown files with metadata + an auto-loaded index
-- **Automation:** n8n, Claude API, workflow integrations
-- **Discipline:** verification-after-change as a standing rule, not an afterthought
+- replace usernames, home directories, project names, IDs, URLs, and dates;
+- exclude `.env` files, credentials, browser profiles, transcripts, databases, and local agent state;
+- publish templates rather than copies of live global instruction files;
+- inspect the complete Git diff before every public push.
 
----
+The repository `.gitignore` blocks common local state and secret-file patterns, but it is only a backstop.
 
-*Built and maintained by [Pierce Hollar](https://www.linkedin.com/in/pierce-hollar-111276361).*
+## Product-specific loading behavior
+
+- Claude Code supports user and project `CLAUDE.md` files, project rules, and per-project auto memory. See the official [Claude Code memory documentation](https://code.claude.com/docs/en/memory).
+- Codex reads global guidance from `AGENTS.md` in `CODEX_HOME` (normally `~/.codex`) and layers repository guidance from the project root toward the working directory. See the official [Codex `AGENTS.md` documentation](https://learn.chatgpt.com/docs/agent-configuration/agents-md).
+
+Those products may change independently. Re-check their official documentation before turning this reference into automation.
+
+Maintained by [Pierce Hollar](https://github.com/piercehollar1-tech).
