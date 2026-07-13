@@ -1,0 +1,13 @@
+.DS_Store
+.letta/
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Private adaptations of the public blueprint
+reference/private/
+private/
