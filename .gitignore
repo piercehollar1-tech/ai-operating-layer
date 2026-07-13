@@ -1,5 +1,7 @@
 .DS_Store
 .letta/
+__pycache__/
+*.py[cod]
 
 # Local credentials and environment overrides
 .env
