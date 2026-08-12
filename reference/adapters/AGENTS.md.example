@@ -1,0 +1,33 @@
+# Shared context adapter
+
+This is a fictional template. Merge it into the appropriate Codex instruction file; do not copy it over an existing file without review.
+
+## Shared root
+
+The private shared context root is `your_private_shared_root`.
+
+Start with the current user request and repository-local `AGENTS.md` guidance. Access the shared root only when the task needs cross-session or personal context.
+
+## Retrieval ladder
+
+1. Read `your_private_shared_root/TODAY.md` when current focus or handoff state is relevant.
+2. Read `your_private_shared_root/QUICK_CONTEXT.md` when system orientation is relevant.
+3. Check `your_private_shared_root/memory/MEMORY.md`, then open only the topic file that owns the subject.
+4. If the hot index misses, search the shared memory and vault narrowly.
+5. Follow at most one relevant note link before reassessing.
+
+Do not bulk-read the memory or vault. Do not assume that Claude Code hooks, permissions, plugins, or `CLAUDE.md` apply to Codex.
+
+## Durable saves
+
+When the user explicitly asks to remember, recap, or hand off work:
+
+- update an existing owner note before creating a new one;
+- keep `MEMORY.md` concise and use it as an index;
+- put long-form project decisions in the vault;
+- append one concise entry to `vault/log.md` for a meaningful vault change;
+- keep credentials and raw transcripts out of all shared stores.
+
+## Governance
+
+Propose changes to global instructions, shared skills, hooks, permissions, and memory conventions before applying them. Verify that any installed component actually loads and affects the intended behavior.

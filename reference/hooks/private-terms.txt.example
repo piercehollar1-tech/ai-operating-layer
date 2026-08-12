@@ -1,0 +1,45 @@
+# EXAMPLE term file for pre-publish-scan.py.example — every entry is fictional.
+#
+# One regex per line. Blank lines and # comments ignored. Case-insensitive.
+#
+# THIS FILE BELONGS OUTSIDE ANY PUBLISHED TREE. It is committed here only as a
+# shape reference. A real term file contains the strings you are protecting, so
+# publishing one defeats its own purpose. Keep yours in your private config
+# directory, readable only by you.
+#
+# For GENERATED output, prefer an allowlist over this approach entirely: assert
+# that every string in the artifact is one you intended to publish. A denylist
+# only catches leaks somebody predicted.
+
+# --- machine and identity ---
+/Users/example-user
+/home/example-user
+\bexample-user\b
+first\.last@example\.com
+
+# --- location ---
+\bExampleville\b
+\b00000\b
+
+# --- private projects ---
+\binternal-dashboard\b
+\bclient-portal\b
+
+# --- private conventions that are not documented public paths ---
+#
+# Note what is deliberately ABSENT: the documented install path for a skill or
+# plugin. Every public repository that ships one has to print it, so matching it
+# produces false positives on legitimate work. The absolute-home-prefix rules
+# above already catch the version that actually leaks.
+#
+# When a pattern false-positives, narrow the pattern and re-run the full test
+# suite. Do not exclude the path — that converts an alarm into silence. Write
+# the reasoning next to the pattern, or a later edit will simplify it back.
+\bprivate-notes-root\b
+
+# --- credential shapes ---
+gh[pousr]_[A-Za-z0-9]{16,}
+sk-[A-Za-z0-9]{20,}
+AKIA[0-9A-Z]{16}
+-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE
+eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}

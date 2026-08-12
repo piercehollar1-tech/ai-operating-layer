@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""EXAMPLE — block a publish to a public destination when the tree carries private data.
+
+Fictional example for the reference tree. Adapt the trigger patterns and the
+term file to your client and your own private terms; do not run it unreviewed.
+
+Design notes worth keeping if you rewrite this:
+
+  * It scans CACHED **and** UNTRACKED files. A leak added in the same shell
+    line as the publish ("add && commit && push") is still untracked when a
+    pre-command hook runs, so a tracked-files-only scan misses the exact case
+    this exists to catch. Ignored files are excluded, since they cannot ship.
+
+  * It has no exclude list, deliberately. An exclusion added to quieten noise
+    is where unreviewed content collects.
+
+  * It FAILS CLOSED. If the destination's visibility cannot be resolved, it is
+    treated as public.
+
+  * The term file lives OUTSIDE any published tree. A denylist committed to a
+    public repository publishes the strings it exists to suppress. For
+    generated output prefer an allowlist instead: assert every string present
+    is one you intended to publish.
+
+Hook payload arrives on stdin as JSON. Clients do not pass tool input via
+environment variables.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+TERMS_FILE = Path(__file__).parent / "private-terms.txt.example"
+MAX_FILE_BYTES = 2_000_000
+BINARY_SUFFIXES = {".png", ".jpg", ".gif", ".pdf", ".zip", ".gz", ".woff2", ".pyc"}
+
+PUBLISH_PATTERNS = (
+    re.compile(r"\bgit\s+push\b"),
+    re.compile(r"\bgh\s+repo\s+create\b"),
+    re.compile(r"\bgh\s+gist\s+create\b"),
+    re.compile(r"\bgh\s+release\s+create\b"),
+    re.compile(r"\bgh\s+repo\s+edit\b.*--visibility\s+public"),
+)
+
+
+def load_terms() -> list[re.Pattern]:
+    out = []
+    for line in TERMS_FILE.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(re.compile(line, re.IGNORECASE))
+    return out
+
+
+def run(args: list[str], cwd: str) -> str | None:
+    try:
+        r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=20)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def destination_is_public(command: str, cwd: str) -> bool:
+    if "--public" in command or re.search(r"--visibility\s+public", command):
+        return True
+    if re.search(r"\bgh\s+(repo|gist)\s+create\b", command):
+        return False
+    visibility = run(["gh", "repo", "view", "--json", "visibility",
+                      "--jq", ".visibility"], cwd)
+    if visibility is None:
+        return True  # unresolved -> assume public
+    return visibility.upper() == "PUBLIC"
+
+
+def scan(root: str, patterns: list[re.Pattern]) -> list[tuple]:
+    listing = run(["git", "ls-files", "-z", "--cached", "--others",
+                   "--exclude-standard"], root)
+    if listing is None:
+        return []
+    hits = []
+    for rel in filter(None, listing.split("\0")):
+        path = Path(root) / rel
+        if path.suffix.lower() in BINARY_SUFFIXES:
+            continue
+        try:
+            if path.stat().st_size > MAX_FILE_BYTES:
+                continue
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            for pat in patterns:
+                if pat.search(line):
+                    hits.append((rel, n, pat.pattern, line.strip()[:90]))
+                    break
+    return hits
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0
+    if payload.get("tool_name") != "Bash":
+        return 0
+    command = (payload.get("tool_input") or {}).get("command", "")
+    if not any(p.search(command) for p in PUBLISH_PATTERNS):
+        return 0
+
+    cwd = payload.get("cwd") or os.getcwd()
+    root = run(["git", "rev-parse", "--show-toplevel"], cwd)
+    if root is None or not destination_is_public(command, cwd):
+        return 0
+
+    hits = scan(root, load_terms())
+    if not hits:
+        return 0
+
+    print(f"BLOCKED: public destination, and the tree contains private data.\n"
+          f"{len(hits)} match(es):\n", file=sys.stderr)
+    for rel, n, pattern, snippet in hits[:40]:
+        print(f"  {rel}:{n}\n      matched /{pattern}/\n      {snippet}",
+              file=sys.stderr)
+    print("\nDo not add an exclusion. Remove the content, or move it out of the "
+          "repository and ignore its path, then retry.", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
