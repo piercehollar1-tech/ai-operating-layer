@@ -16,12 +16,23 @@ REQUIRED_PATHS = (
     "LICENSE",
     "README.md",
     "docs/architecture.md",
+    "docs/automation.md",
+    "docs/context-delivery.md",
+    "docs/delegation.md",
+    "docs/enforcement.md",
+    "docs/intake-security.md",
+    "docs/response-contract.md",
     "docs/setup.md",
+    "docs/verification.md",
     "reference/BOOTSTRAP_PROMPT.md",
     "reference/README.md",
     "reference/adapters/AGENTS.md.example",
     "reference/adapters/CLAUDE.md.example",
+    "reference/adapters/output-style.md.example",
+    "reference/agents/worker.md.example",
+    "reference/hooks/routes.json.example",
     "reference/shared/memory/MEMORY.md",
+    "reference/shared/skill-notes/example-workflow.md",
     "reference/shared/skills/example-workflow/SKILL.md",
     "reference/shared/vault/index.md",
 )
@@ -55,8 +66,11 @@ MARKDOWN_LINK = re.compile(r"!?\[[^\]]+\]\(([^)]+)\)")
 
 
 def repository_files() -> list[Path]:
+    # Tracked AND untracked (ignored excluded): content staged in the same command as a
+    # push is still untracked when a pre-command check runs, so a tracked-only listing
+    # validates a tree that is not the one about to ship.
     result = subprocess.run(
-        ["git", "ls-files", "-z"],
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=ROOT,
         check=True,
         stdout=subprocess.PIPE,

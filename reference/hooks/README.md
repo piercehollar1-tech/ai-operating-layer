@@ -10,6 +10,7 @@ Nothing here is wired up. Adapt it to your client's hook mechanism, replace ever
 |---|---|
 | `pre-publish-scan.py.example` | Blocking a publish to a public destination when the tree carries private data. Fails closed, scans untracked as well as tracked files, has no exclude list. |
 | `private-terms.txt.example` | The shape of a term file — and why it must live outside any published tree. |
+| `routes.json.example` | A routing table for a pre-tool nudge: fires the adapter's routing pointers at the tool call, as added context only. |
 
 ## Lifecycle map
 
@@ -37,3 +38,9 @@ Hook point names vary by client. These categories do not. A layer that only logs
 **Live-probe after a client update.** Hook payload shapes and event names change. A control that silently stopped firing is worse than no control, because you stopped watching for the thing yourself.
 
 **Record the incident that produced it.** A hook whose motivation is undocumented gets weakened by whoever next finds it inconvenient.
+
+**Say it through the channel each party can see.** A permission prompt's reason reaches the user, not the model. An instruction to the model belongs in the added-context field; a fact for the user belongs in the reason. Say it twice when both need it.
+
+**Give every gate a probe suite with a `# covers:` line, and run all suites from a Stop hook after any edit under the hooks directory.** Coverage declared, not inferred; a stale declaration reads as uncovered. See [../../docs/verification.md](../../docs/verification.md).
+
+**Probe with the home directory redirected.** A hook run by hand really writes to its logs and state. One writer per event; re-run the whole case list after each fix.

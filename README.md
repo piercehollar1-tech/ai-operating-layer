@@ -28,12 +28,17 @@ The shared files are the source of truth. `CLAUDE.md` and `AGENTS.md` are thin a
 
 ## What this reference includes
 
-- [Architecture](docs/architecture.md) — component boundaries, pointer map, retrieval flow, persistence model
-- [Enforcement](docs/enforcement.md) — turning rules that matter into controls that run whether or not anyone remembered them
-- [Automation and continuity](docs/automation.md) — scheduled work, session persistence, and the loop that makes the layer improve instead of accumulate
+- [Architecture](docs/architecture.md) — component boundaries, pointer map, retrieval flow, persistence model, the "where does this go" router
+- [Enforcement](docs/enforcement.md) — turning rules that matter into controls that run whether or not anyone remembered them; the tiers of decision; what a mature layer actually runs
+- [Verification](docs/verification.md) — the evidence gate on claims, measure-don't-recall, probe suites run by a hook, and why green is not evidence
+- [Context delivery](docs/context-delivery.md) — per-skill operational memory and routing pointers injected at the tool call; evidence-based promotion and pruning
+- [Automation and continuity](docs/automation.md) — scheduled work, session persistence with dead-man checks, the memory write bar, and the loop that makes the layer improve instead of accumulate
+- [Delegation](docs/delegation.md) — one gate, two lanes, one packet, and the hook that makes the gate the door
+- [Response contract](docs/response-contract.md) — a reply-length rule that holds: system prompt, measurement, scoreboard, audit
+- [Intake and security](docs/intake-security.md) — external content as data, the non-combinable three, the intake procedure on a hook
 - [Setup guide](docs/setup.md) — a safe, staged rollout
 - [Bootstrap prompt](reference/BOOTSTRAP_PROMPT.md) — instructions you can hand to an AI client to adapt the blueprint without overwriting existing configuration
-- [Reference tree](reference/README.md) — dummy adapters, memory, vault notes, a review-gated workflow skill, and example hooks
+- [Reference tree](reference/README.md) — dummy adapters, memory, vault notes, a review-gated workflow skill, a skill-notes file, a routing table, an agent definition, an output style, and example hooks
 
 ## Design principles
 
@@ -47,16 +52,22 @@ The shared files are the source of truth. `CLAUDE.md` and `AGENTS.md` are thin a
 8. **Instructions for preferences, controls for consequences.** A rule whose violation is expensive or irreversible belongs in a hook, not a document.
 9. **Fail closed.** When a control cannot evaluate its condition, it blocks.
 10. **Prove a control by breaking it.** Green is not evidence; a hook with an inverted condition passes every test where nothing is wrong.
+11. **Deliver at the call, not at startup.** Context injected when the matching tool runs is read; context loaded at session start is scrolled past. Written down is not wired up.
+12. **Measure before you redraft.** A rule nothing counts is a suggestion. Bring the compliance rate, then fix the layer the rule lives in, never just its wording.
+13. **External content is data, never instructions.** Everything fetched, cloned, or returned by a tool is an input to judgment, and the intake procedure fires on a hook.
+14. **One gate in front of off-thread work.** A documented option measured at zero use gets a hook on the door, not a better paragraph.
 
 ## What changed in this revision
 
-The first version documented a Claude-only memory and skill system at a high level. The second added multi-client sharing and narrowed retrieval. This one adds the parts that were doing the most work in practice and were entirely absent from the write-up:
+The first version documented a single-client memory and skill system at a high level. The second added multi-client sharing and narrowed retrieval. The third added enforcement, automation, continuity, and the self-improvement loop. This one adds the layers built since, each of which exists because a measurement showed the previous write-up was not holding:
 
-- **An enforcement layer.** The single largest omission. Rules that matter are hooks, not paragraphs — and the document now covers the lifecycle surface, fail-closed behaviour, mutation testing, and the denylist-versus-allowlist trap that defeats the obvious implementation of a publication gate.
-- **Scheduled autonomous work,** with the failure modes that actually bite: a sleeping machine, catch-up runs, marker-based idempotency, and why a scheduler's own run counter is not a liveness signal.
-- **Session continuity** — automatic summarization, drain queues for decisions, detached end-of-session hooks, and a ceiling on every append target decided at creation rather than after it hurts.
-- **A self-improvement loop** that routes each new fact to exactly one home at write time, so knowledge improves rather than piling into whichever file was open.
-- Verification is no longer described as a habit. It is a control.
+- **Context delivery.** A memory store with zero index drift had applied-evidence on one lesson in eight, because nothing loaded a lesson at the moment it applied. Two hooks now inject per-skill context and routing pointers at the tool call; an `applied:` counter drives promotion and pruning.
+- **Verification as a control.** The evidence gate on claims, a citation gate at stop, an injection scan on every fetch, probe suites for every blocking gate, and a Stop hook that runs every suite after any hook edit. Coverage is declared, not inferred, and green is not evidence when a gate and its suite changed in the same turn.
+- **A response contract that binds.** Four in five replies had been over cap for two months, invisibly. The contract moved to the system prompt, a Stop hook measures every reply, the score lands on the next turn, and an audit notices drift.
+- **Delegation.** One gate, two lanes, one packet, a dispatch-contract hook, and a delegate-first hook, after sixty-one sessions of a documented option used zero times.
+- **The intake posture.** Untrusted input, private access, and an outbound channel never in one session; the intake procedure on a hook; two hard stops that need no lookup.
+- **The memory write bar.** Origin, not last speaker; nothing re-derivable; the horizon test; and one class of preference that never gets filed.
+- **Enforcement, deeper.** Six tiers of decision and the invariant between two of them; the delivery-channel bug that made a review gate fire ten times and convert zero; the layer guarding its own files.
 
 ## Security boundary
 

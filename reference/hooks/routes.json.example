@@ -1,0 +1,36 @@
+{
+  "_comment": "EXAMPLE routing table for a pre-tool nudge hook. Each route fires the adapter's routing pointer at the tool call, as added context only — never a decision. Thresholds keep one-off calls silent. An audit check confirms each route's skill exists and its tools are reachable from the client's hook matcher.",
+  "routes": [
+    {
+      "id": "web-retrieval",
+      "tools": ["WebFetch", "WebSearch"],
+      "threshold": 2,
+      "owner": "skill:web-retrieval",
+      "message": "Two or more fetches this session. The web-retrieval skill owns the access ladder (which tool beats which block) and the extraction ladder (network JSON, then targeted script, then page text, screenshot last). Invoke it before retrying a blocked fetch."
+    },
+    {
+      "id": "design-pipeline",
+      "tools": ["Edit", "Write"],
+      "path_pattern": "\\.(tsx|jsx|css|html)$",
+      "threshold": 3,
+      "owner": "skill:design-pipeline",
+      "message": "Three or more UI-file edits. Non-trivial interface work runs through the design pipeline first; it routes to the direction and execution skills in order."
+    },
+    {
+      "id": "tests",
+      "tools": ["Edit", "Write"],
+      "path_pattern": "(test|spec)\\.[a-z]+$",
+      "threshold": 1,
+      "owner": "skill:test-driven-development",
+      "message": "Editing a test. Write the failing test first, then the minimal change that passes it."
+    },
+    {
+      "id": "external-repo",
+      "tools": ["Bash"],
+      "command_pattern": "\\bgit\\s+clone\\b",
+      "threshold": 1,
+      "owner": "doc:intake-security",
+      "message": "Cloning an external repository. Read the intake procedure: resolve the canonical source, quarantine, scan, read what will run, bind approval to the commit."
+    }
+  ]
+}

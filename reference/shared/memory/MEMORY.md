@@ -8,7 +8,7 @@ Keep this file short. Store detail in focused files and link to them.
 
 ## Feedback and preferences
 
-- Verify that a component is loaded and exercised before calling it installed.
+- [Verify before claiming](feedback_lesson-example.md) — existence is not consumption; applied twice, one short of promotion.
 
 ## Cold index
 

@@ -7,18 +7,25 @@ reference/
 ├── BOOTSTRAP_PROMPT.md
 ├── adapters/
 │   ├── AGENTS.md.example
-│   └── CLAUDE.md.example
+│   ├── CLAUDE.md.example
+│   └── output-style.md.example
+├── agents/
+│   └── worker.md.example
 ├── hooks/
 │   ├── README.md
 │   ├── pre-publish-scan.py.example
-│   └── private-terms.txt.example
+│   ├── private-terms.txt.example
+│   └── routes.json.example
 └── shared/
     ├── QUICK_CONTEXT.md
     ├── TODAY.md
     ├── memory/
     │   ├── MEMORY.md
     │   ├── MEMORY-ARCHIVE.md
+    │   ├── feedback_lesson-example.md
     │   └── project_example.md
+    ├── skill-notes/
+    │   └── example-workflow.md
     ├── skills/
     │   └── example-workflow/
     │       └── SKILL.md
@@ -31,8 +38,15 @@ reference/
             └── example-project.md
 ```
 
-`hooks/` is separate from both: a control layer is client-specific and does not port between
-clients, even when the context beneath it is shared. See [../docs/enforcement.md](../docs/enforcement.md).
+`hooks/`, `agents/`, and the output style are separate from both: a control layer, an agent
+definition, and a system-prompt style are client-specific and do not port between clients, even
+when the context beneath them is shared. See [../docs/enforcement.md](../docs/enforcement.md),
+[../docs/delegation.md](../docs/delegation.md), and
+[../docs/response-contract.md](../docs/response-contract.md).
+
+`shared/skill-notes/` is the per-skill operational memory the preflight hook injects on
+invocation; `shared/memory/feedback_lesson-example.md` shows a lesson with its `applied:` line.
+See [../docs/context-delivery.md](../docs/context-delivery.md).
 
 The adapters are intentionally separate from `shared/`. Install them through each client’s supported instruction mechanism and replace `your_private_shared_root` with the private shared directory.
 

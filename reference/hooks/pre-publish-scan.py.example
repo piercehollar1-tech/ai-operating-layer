@@ -15,7 +15,11 @@ Design notes worth keeping if you rewrite this:
     is where unreviewed content collects.
 
   * It FAILS CLOSED. If the destination's visibility cannot be resolved, it is
-    treated as public.
+    treated as public. If the payload is malformed, the repository root cannot
+    be found, or the file list cannot be produced, it blocks: an unscanned tree
+    is not a clean tree. Binary suffixes and files over the size cap are still
+    skipped, which is a known hole; a real installation scans archives and
+    large files separately or blocks on their presence.
 
   * The term file lives OUTSIDE any published tree. A denylist committed to a
     public repository publishes the strings it exists to suppress. For
@@ -75,11 +79,17 @@ def destination_is_public(command: str, cwd: str) -> bool:
     return visibility.upper() == "PUBLIC"
 
 
-def scan(root: str, patterns: list[re.Pattern]) -> list[tuple]:
+def block(reason: str) -> int:
+    print(f"BLOCKED: {reason}\nThe gate could not evaluate its condition, so it "
+          "treats the publish as unsafe. Fix the cause and retry.", file=sys.stderr)
+    return 2
+
+
+def scan(root: str, patterns: list[re.Pattern]) -> list[tuple] | None:
     listing = run(["git", "ls-files", "-z", "--cached", "--others",
                    "--exclude-standard"], root)
     if listing is None:
-        return []
+        return None  # caller blocks: an unlistable tree is an unscanned tree
     hits = []
     for rel in filter(None, listing.split("\0")):
         path = Path(root) / rel
@@ -103,7 +113,7 @@ def main() -> int:
     try:
         payload = json.load(sys.stdin)
     except Exception:
-        return 0
+        return block("hook payload was not valid JSON")
     if payload.get("tool_name") != "Bash":
         return 0
     command = (payload.get("tool_input") or {}).get("command", "")
@@ -112,10 +122,20 @@ def main() -> int:
 
     cwd = payload.get("cwd") or os.getcwd()
     root = run(["git", "rev-parse", "--show-toplevel"], cwd)
-    if root is None or not destination_is_public(command, cwd):
+    if root is None:
+        return block("could not resolve the repository root from the working directory")
+    if not destination_is_public(command, cwd):
         return 0
 
-    hits = scan(root, load_terms())
+    try:
+        terms = load_terms()
+    except (OSError, re.error) as exc:
+        return block(f"could not load the term file: {exc}")
+    if not terms:
+        return block("the term file is empty; an empty scan is not a clean scan")
+    hits = scan(root, terms)
+    if hits is None:
+        return block("could not list the files that would ship")
     if not hits:
         return 0
 

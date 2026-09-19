@@ -91,6 +91,22 @@ Test the real loading or enforcement path after each change. Keep runtime state 
 configuration or executable directories. Failure modes and design rules in
 [automation](automation.md).
 
+## 7. Wire delivery, then measure
+
+Only after the controls above are proven:
+
+- a skill-preflight hook that injects `skill-notes/<skill>.md` and bound lessons on invocation,
+  and a routing table fired at the tool call ([context delivery](context-delivery.md));
+- the reply contract as an output style in the system prompt, with a Stop hook that measures
+  every reply and a prompt hook that reports the score ([response contract](response-contract.md));
+- the delegation gate, with the dispatch-contract and delegate-first hooks
+  ([delegation](delegation.md));
+- probe suites for every blocking gate, run by a Stop hook after any hook edit
+  ([verification](verification.md)).
+
+For each one, take the baseline measurement first. A rule with no count is a suggestion, and the
+count is what tells you whether the wiring worked.
+
 ## Public-release checklist
 
 Before publishing changes derived from a private installation:

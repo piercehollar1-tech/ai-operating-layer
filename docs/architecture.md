@@ -19,6 +19,13 @@ This blueprint separates durable knowledge, reusable procedures, and client-spec
 | Control layer | Client-owned hook directory | Lifecycle events | Refusing what must not happen, regardless of what the model intended — see [enforcement](enforcement.md) |
 | Scheduled workers | OS scheduler plus a job directory | The shared store | Recurring work that must not depend on a session existing — see [automation](automation.md) |
 | Session record | `your_private_shared_root/vault/Sessions/` | Summaries and a decisions queue | Continuity across sessions without replaying transcripts |
+| Skill context | `your_private_shared_root/skill-notes/<skill>.md` | One skill | Operational memory per skill, injected on invocation — see [context delivery](context-delivery.md) |
+| Skill index | Client config, generated | Every skill, by use-case category | The picker; the adapter reads one category, never the whole file |
+| Routing table | Client hook directory, `routes.json` | Skills and documents | Fires the adapter's routing pointers at the tool call |
+| Output style | Client config, system-prompt layer | — | The reply contract, loaded where instructions are not — see [response contract](response-contract.md) |
+| Agent definitions | Client agents directory | Model tier, tools, purpose | Cold subagents dispatched by name — see [delegation](delegation.md) |
+| State and logs | Client state directory | Hooks and audits | The verbosity dial, heartbeats, usage and gate logs, the audit dismissal store |
+| Audit | Client scripts, run at session start | Every layer above | Read-only drift and cruft scan; findings fixed, routed, or converted to a check — never noted and forgotten |
 
 ## Suggested private tree
 
@@ -61,6 +68,27 @@ The adapters should define a narrow ladder rather than loading the entire shared
 
 A semantic or hybrid search index can improve step 5, but the Markdown files remain canonical. The index should be rebuildable and should not become a second memory store.
 
+Two things sit outside the ladder because they are delivered rather than retrieved: a skill's operational context arrives when the skill is invoked, and a routing pointer arrives when the matching tool is called. Neither depends on the model remembering to look. See [context delivery](context-delivery.md).
+
+## The "where does this go" router
+
+Every persistent instruction has one correct layer, decided at write time:
+
+| The thing | Its layer |
+|---|---|
+| Always-true fact or irreversible rule | The adapter, under a hard line count |
+| On-demand how-to or procedure | A skill; its body loads only when invoked |
+| Repeated user-invoked action | A slash command |
+| Work that should stay out of the main context | A subagent |
+| Something that must be mechanically enforced | A hook |
+| Cross-session fact | File memory or the vault |
+
+If it only matters sometimes, it does not belong in the always-loaded adapter. The adapter is the routing layer; it states the rule and points at the mechanism.
+
+## The trivial-task fast path
+
+Full pre-work — a coding-discipline skill, a documentation lookup for any third-party library, brainstorming, skill matching — applies only to non-trivial work: new features, multi-file changes, refactors, anything touching public interfaces, data schemas, or security-sensitive code. Single-file edits, copy tweaks, one-liners, renames, and read-only questions skip it. Without the fast path, the pre-work becomes the tax that makes people turn the pre-work off.
+
 ## Persistence flow
 
 Route new information to the smallest durable home:
@@ -99,11 +127,16 @@ This boundary is why the adapters stay thin. They translate durable conventions;
 
 ## Beyond the context layer
 
-Once the file layer is stable, three subsystems change what it is capable of. They are ordered by how much they repay the effort:
+Once the file layer is stable, these subsystems change what it is capable of. They are ordered by how much they repay the effort:
 
 1. **A control layer.** Rules whose violation is expensive belong in hooks rather than documents. This is the highest-value addition and the hardest to retrofit, because nothing looks broken while it is missing. → [enforcement](enforcement.md)
-2. **Scheduled autonomous work and session continuity.** Recurring jobs that do not need a session, plus summaries and a decisions queue so work survives the end of one. → [automation](automation.md)
-3. **A self-improvement loop.** New knowledge routed to exactly one home at write time, so the layer improves instead of accumulating. → [automation](automation.md)
+2. **Verification as a control.** An evidence gate on claims, a citation gate at stop, probe suites for every gate run by a hook after every hook edit. → [verification](verification.md)
+3. **Context delivery.** Per-skill operational memory and routing pointers injected at the tool call, with evidence-based promotion and pruning of lessons. → [context delivery](context-delivery.md)
+4. **Scheduled autonomous work and session continuity.** Recurring jobs that do not need a session, plus summaries and a decisions queue so work survives the end of one. → [automation](automation.md)
+5. **A self-improvement loop.** New knowledge routed to exactly one home at write time, behind a write bar, so the layer improves instead of accumulating. → [automation](automation.md)
+6. **A delegation layer.** Bounded work routed off the main thread through one gate and one packet format, with the gate enforced at dispatch. → [delegation](delegation.md)
+7. **A reply contract in the system prompt**, measured after every reply. → [response contract](response-contract.md)
+8. **An intake posture** for everything external, with the procedure on a hook. → [intake and security](intake-security.md)
 
 Genuinely optional, in roughly this order of usefulness:
 
