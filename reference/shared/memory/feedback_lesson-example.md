@@ -17,6 +17,6 @@ done because the file existed.
 **How to apply:** after any install, confirm the client lists or invokes the component. After
 any hook change, drive the exact registered command with the input it exists to catch. Append
 today's date to `applied:` above each time this rule changes what you do; three applications
-promote it to the adapter, none in sixty days prunes it.
+promote it to the adapter, none in sixty days prunes it (unless a dated `keep:` line says why).
 
 Related: [[project_example]]

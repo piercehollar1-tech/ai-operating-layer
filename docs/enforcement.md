@@ -51,6 +51,20 @@ Not every control blocks the same way. A mature layer has six tiers, and an inva
 
 Clients deliver a permission prompt's reason to the user, not to the model. An instruction to the model placed in an `ask` reason is never seen by the model; the user gets two buttons, neither of which runs a skill. A gate that fired ten times and converted zero was built exactly this way, and the fix was not tuning: the gate now says it twice, the reason to the user in the prompt and the same fact to the model as added context, phrased as an action. Confirm delivery live after any client update; the field that carries context to the model has changed shape before.
 
+The blindness runs the other way too. **The model cannot observe a permission prompt.** An approved prompt and an auto-allowed call return the same result; only a denial is visible. So the model's claim that "no prompt appeared" is not evidence. When the question is whether a human was asked, the user's terminal is the authority, or the permission rules read from the settings file.
+
+## Hook mechanics that change the design
+
+**Hooks for one event run together, not in order.** In at least one major client, every matching hook for an event runs in parallel, and the position of a hook in the settings file conveys nothing. For a pre-tool permission decision the most restrictive answer wins (deny, then defer, then ask, then allow); added context from every hook is kept. Consequences: a hook cannot rely on another hook for the same event having run first (a session-end commit cannot see the summary a sibling hook is still writing), and no two hooks should rewrite the same tool's input, because the last to finish wins. Check your client's documentation for its own rule.
+
+**A stop hook fires after the reply has streamed.** Blocking cannot unsend it; it appends a retry and pays for the whole context again. Stop hooks are where you measure and record. Anything about the text itself belongs in the system prompt. See [response contract](response-contract.md).
+
+**A model-evaluated hook on user input has no safe failure mode.** A hook that asks a small model to classify each message, and to return an empty result for follow-ups, was answered with a sentence explaining why a message was a follow-up. The client treated that prose as a block reason, and the user's next five messages, including "what happened?", were refused. Every other hook can be written to fail open or closed deliberately; this one fails closed on the user whenever the evaluator is chatty. Never register one live. Prove in a headless harness, with the settings passed for that run only, that a follow-up passes and a task fires.
+
+**Treat a path placeholder as text.** Some clients substitute placeholders such as a project directory into a hook command as plain text before running it. In shell form, a folder name containing command syntax becomes a command. Exec form (an executable plus an argument list, no shell) never interprets it. Every hook that is shipped to other machines uses exec form.
+
+**A timeout is a silent kill.** A session-start audit measured at about eleven seconds had a ten-second timeout. It was killed every session before it printed, so its findings never reached anyone, and each kill stranded a scratch file. The fix kept the coverage: the timeout was raised, the scripts trap termination and clean up, and the sentinel now prints the previous run's saved result (marked with its age) and refreshes in the background. A saved result older than two days reports itself as stale; a crash is saved and shown; a lock stops two refreshes at once. Measure every hook's runtime against its timeout, and pin the relationship in a probe.
+
 ## What a mature layer actually runs
 
 Roughly fifty hook registrations across the surface above, in one installation. The inventory, generalized, so the categories are visible without the names:
@@ -67,6 +81,8 @@ Roughly fifty hook registrations across the surface above, in one installation. 
 | Session end | — | Detached backup · transcript summary · vault commit |
 
 **The layer guards itself.** An edit to the client settings, the adapter, or any hook file prompts. Without that, the cheapest way past every control is to edit the control.
+
+**Every trigger in one reviewable file, and every fire counted.** The routing table holds each route's matcher, threshold, and message, and each fire writes one row to a gate log. A route that delivers its content in full is logged as delivered, not fired, and is never held to a conversion rate: without that distinction, a route working as designed shows up in the audit as ignored. A trigger with no fire log has no denominator, and a gate with no denominator cannot be judged.
 
 ## Categories that earn their place
 
@@ -133,9 +149,26 @@ The allowlist is strictly stronger, and the reason is not subtle: **a denylist o
 
 **Scan the whole tree, with nothing excluded.** An exclusion added to reduce noise is precisely where unreviewed content accumulates. If a scan skips a documentation directory, then a document is the thing that leaks. Tolerate the false positives and read them.
 
-**Scan staged and untracked files, not just tracked ones.** A leak added in the same shell line as the publication — `add`, `commit`, and `push` chained together — is still untracked when a pre-command hook runs. Honour the ignore file, since ignored content cannot ship, but do not restrict the scan to what the index already knows about.
+**Scan staged and untracked files, not just tracked ones.** A leak added in the same shell line as the publication — `add`, `commit`, and `push` chained together — is still untracked when a pre-command hook runs. Ignored files normally cannot ship, so the scan may skip them, but not when the command force-adds (`git add -f` publishes an ignored file). Do not restrict the scan to what the index already knows about.
 
 Both of these are stated as rules because both were discovered by a scan that reported clean while a leak sat inside the tree.
+
+**Scan what the push publishes, not just what is on disk.** A push carries every commit the remote does not have. A leak committed and then deleted in a later commit is gone from the working tree and still in the push; a staged copy can differ from the working copy. Scan the staged index and the added lines of every unpushed commit as well as the files.
+
+**Check the destination the push will use.** A remote's push URL can differ from its fetch URL, and a command can change directory (`cd dir && git push`, `git -C dir push`) before it pushes. Resolve the repository and the push URL from the command itself; anything that cannot be resolved is public.
+
+**Never echo the match.** A report that prints the matched line, or the pattern that matched, copies the protected value into logs and the conversation. Report the file, the line, and a rule number.
+
+Two rounds of outside review found these gaps, and a dozen more, in earlier versions of the example hook in [`reference/hooks/`](../reference/hooks/pre-publish-scan.py.example), each after the hook's own probe suite had passed. Each is now a probe with a matching mutation.
+
+### Two layers, because a command string is not a push
+
+A gate that runs before the agent's shell command sees only the command text. It cannot see a file that an earlier step of the same command will create, and it parses shell with patterns that an alias, a script, or `eval` can slip past. Those limits are structural; more patterns do not close them. So the publication gate has two layers:
+
+1. **The agent-side gate**, before the command runs: cheap, catches the ordinary shapes, and fails closed on what it cannot resolve.
+2. **Git's own `pre-push` hook**, which git runs with the exact local and remote refs being pushed, after everything earlier in the command has happened. It scans exactly the commits that are about to leave, whatever command started the push.
+
+A hosting provider's secret scanning, where available, is a third layer after the fact: useful for detection, too late for prevention.
 
 ### Tuning versus excluding
 

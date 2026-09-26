@@ -29,7 +29,7 @@ A post-tool hook on skill invocation injects, once per skill per session:
 
 A pre-tool hook reads a small routing table and fires the adapter's routing pointers at the tool call: "for this class of fetch, the `web-retrieval` skill owns the access ladder"; "before this design edit, the design pipeline runs first". Thresholds keep one-off calls silent. The hook adds context only; it never blocks.
 
-The routing table declares, per route: the tool matcher, the skill or document that owns the task, the threshold, and the message. An audit check confirms each route names a skill that exists and a tool reachable from the client's hook matcher.
+The routing table declares, per route: the tool matcher, the skill or document that owns the task, the threshold, and the message. An audit check confirms each route names a skill that exists and a tool reachable from the client's hook matcher. Each fire writes a row to a gate log, so a route has a denominator and its conversion can be measured rather than guessed; a route that delivers its content in full logs as delivered and is not held to a conversion rate.
 
 ### 3. The skill index
 
@@ -50,8 +50,18 @@ Each lesson file carries an `applied:` frontmatter line. Each time the lesson ac
 | Evidence | Action |
 |---|---|
 | Applied three or more times across different situations | Promote to an always-loaded adapter rule (stamp `promoted:`) |
-| Zero applications in sixty days | Prune |
+| Zero applications in sixty days | Prune, unless it carries a dated `keep:` line with a reason |
 | Wrong or superseded | Delete the file and its index line |
+
+`keep:` exists for the lesson that is true, stable, and rarely a nameable moment: a framework fact that only matters when one specific error appears, or a rule applied constantly in spirit. It needs a reason and a date, so the exception is visible and can itself be reviewed. Without it, the prune rule deletes exactly the lessons that fire rarely and matter a lot when they do.
+
+## Keep the always-loaded set lean
+
+Every byte in an always-loaded file, an injected context file, or a skill description is paid for in every session that loads it. Three habits keep that bill down without losing anything:
+
+- **Scope rules to the files they govern.** Where the client supports path-scoped rules, a stack's rules carry a path pattern and load only when matching files are in play. One installation found the switch between always-loaded and path-scoped was the presence of a front-matter block, and moved its last always-on stack directory behind a pattern.
+- **Move examples and long reference blocks out of the loaded tree**, leaving the directive and a pointer. A rule needs its sentence; its worked example can load on demand.
+- **Compress for concision periodically, and prove nothing was dropped.** A pass over locally owned skill bodies and context files cut roughly a fifth of their bytes with no rule, table, or routing contract removed. Externally maintained files are left alone: a local edit there is lost on update.
 
 The stamp is still a manual act, but the preflight hook surfaces the reminder next to the lesson at the moment it is being applied, which is the first place that ask has landed anywhere near the action. If coverage stays near zero after that, the stamp needs a mechanism too, not more prose.
 

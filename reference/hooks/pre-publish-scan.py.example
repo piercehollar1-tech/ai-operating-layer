@@ -1,30 +1,61 @@
 #!/usr/bin/env python3
-"""EXAMPLE — block a publish to a public destination when the tree carries private data.
+"""EXAMPLE — block a publish to a public destination when it would carry private data.
 
 Fictional example for the reference tree. Adapt the trigger patterns and the
 term file to your client and your own private terms; do not run it unreviewed.
 
+This is the FIRST of two layers. It runs before the agent's shell command, so
+it sees a command string, not the push itself. A git `pre-push` hook is the
+second layer: git runs it with the exact refs being pushed, after everything
+earlier in the command has happened. Use both. See "Known limits" below.
+
 Design notes worth keeping if you rewrite this:
 
-  * It scans CACHED **and** UNTRACKED files. A leak added in the same shell
-    line as the publish ("add && commit && push") is still untracked when a
-    pre-command hook runs, so a tracked-files-only scan misses the exact case
-    this exists to catch. Ignored files are excluded, since they cannot ship.
+  * It scans what the push can publish, not just what is on disk: every
+    tracked and untracked file in the working tree, file names as well as
+    contents, the staged index, and the added lines of every commit on a local
+    branch or tag that no remote has yet (binary content included). A leak
+    committed and then deleted in a later commit is still in the push. Making
+    a repository public exposes its whole history, so a visibility change
+    scans every commit. Ignored files are skipped only when the command does
+    not force-add ("git add -f" can publish an ignored file).
 
   * It has no exclude list, deliberately. An exclusion added to quieten noise
     is where unreviewed content collects.
 
-  * It FAILS CLOSED. If the destination's visibility cannot be resolved, it is
-    treated as public. If the payload is malformed, the repository root cannot
-    be found, or the file list cannot be produced, it blocks: an unscanned tree
-    is not a clean tree. Binary suffixes and files over the size cap are still
-    skipped, which is a known hole; a real installation scans archives and
-    large files separately or blocks on their presence.
+  * It FAILS CLOSED. An unresolved destination is treated as public. A
+    malformed or incomplete payload, an unresolvable repository, a file list or
+    history that cannot be produced, and a file that cannot be read or is over
+    the size cap all block: an unscanned tree is not a clean tree. Publishing
+    commands whose content it cannot see (a public gist or release with file
+    arguments, a visibility change on another repository) are blocked with a
+    request to run them by hand after review.
+
+  * It checks every publishing operation in the command, and the destination
+    each one will actually use: the push URL (which can differ from the fetch
+    URL) of the named remote or, for a bare push, the branch's push remote,
+    after applying any "cd dir &&" or "git -C dir".
+
+  * Its report names the file, line, and rule number only, and hides a file
+    name that itself matches a rule. Printing the matched text or the pattern
+    would copy the protected value into logs and the conversation.
+
+  * It has a probe suite: tests/pre-publish-scan-probes.py.example, with quiet
+    cases, the inputs it exists to catch, and mutations that must each turn a
+    case red.
 
   * The term file lives OUTSIDE any published tree. A denylist committed to a
     public repository publishes the strings it exists to suppress. For
     generated output prefer an allowlist instead: assert every string present
     is one you intended to publish.
+
+Known limits (why the pre-push layer exists):
+
+  * Content created by an earlier step of the same command ("write a file &&
+    git add && git commit && git push") does not exist yet when this runs.
+  * It parses shell with regular expressions; an unusual wrapper (a script, an
+    alias, eval) can hide a push from it.
+  * Compressed formats (archives, most images) can hide text from a byte scan.
 
 Hook payload arrives on stdin as JSON. Clients do not pass tool input via
 environment variables.
@@ -39,15 +70,16 @@ from pathlib import Path
 
 TERMS_FILE = Path(__file__).parent / "private-terms.txt.example"
 MAX_FILE_BYTES = 2_000_000
-BINARY_SUFFIXES = {".png", ".jpg", ".gif", ".pdf", ".zip", ".gz", ".woff2", ".pyc"}
 
-PUBLISH_PATTERNS = (
-    re.compile(r"\bgit\s+push\b"),
-    re.compile(r"\bgh\s+repo\s+create\b"),
-    re.compile(r"\bgh\s+gist\s+create\b"),
-    re.compile(r"\bgh\s+release\s+create\b"),
-    re.compile(r"\bgh\s+repo\s+edit\b.*--visibility\s+public"),
-)
+GIT_PUSH = re.compile(r"\bgit\b[^;&|\n]*?\spush\b([^;&|\n]*)")  # options may sit between
+REPO_CREATE = re.compile(r"\bgh\s+repo\s+create\b")
+GIST_CREATE = re.compile(r"\bgh\s+gist\s+create\b")
+RELEASE_CREATE = re.compile(r"\bgh\s+release\s+create\b")
+MAKE_PUBLIC = re.compile(r"\bgh\s+repo\s+edit\b.*--visibility\s+public")
+PUBLISH_PATTERNS = (GIT_PUSH, REPO_CREATE, GIST_CREATE, RELEASE_CREATE, MAKE_PUBLIC)
+CD_STEP = re.compile(r"(?:^|[;&|(]\s*)(?:cd|pushd)\s+([^\s;&|)]+)")
+FORCE_ADD = re.compile(r"\bgit\b[^;&|\n]*?\sadd\b[^;&|\n]*\s(?:-f|--force)\b")
+REPO_FLAG = re.compile(r"(?:\s-R|--repo)[=\s]+(\S+)")
 
 
 def load_terms() -> list[re.Pattern]:
@@ -61,22 +93,77 @@ def load_terms() -> list[re.Pattern]:
 
 def run(args: list[str], cwd: str) -> str | None:
     try:
-        r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=20)
+        r = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+                           errors="replace", timeout=20)
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         return None
 
 
-def destination_is_public(command: str, cwd: str) -> bool:
-    if "--public" in command or re.search(r"--visibility\s+public", command):
-        return True
-    if re.search(r"\bgh\s+(repo|gist)\s+create\b", command):
-        return False
-    visibility = run(["gh", "repo", "view", "--json", "visibility",
+def unquote(token: str) -> str:
+    return os.path.expanduser(token.strip("'\""))
+
+
+def repository_dir(command: str, first_publish: re.Match, cwd: str) -> str:
+    for step in CD_STEP.finditer(command[:first_publish.start()]):
+        cwd = os.path.join(cwd, unquote(step.group(1)))
+    other_dir = re.search(r"\bgit\s+-C\s+(\S+)", first_publish.group(0))
+    if other_dir:
+        cwd = os.path.join(cwd, unquote(other_dir.group(1)))
+    source = re.search(r"--source[=\s]+(\S+)", command[first_publish.start():])
+    if REPO_CREATE.match(command, first_publish.start()) and source:
+        cwd = os.path.join(cwd, unquote(source.group(1)))
+    return os.path.normpath(cwd)
+
+
+def visibility_is_public(target: list[str], cwd: str) -> bool:
+    visibility = run(["gh", "repo", "view", *target, "--json", "visibility",
                       "--jq", ".visibility"], cwd)
     if visibility is None:
         return True  # unresolved -> assume public
     return visibility.upper() == "PUBLIC"
+
+
+def default_push_remote(cwd: str) -> str:
+    branch = run(["git", "symbolic-ref", "--short", "-q", "HEAD"], cwd)
+    for key in ([f"branch.{branch}.pushRemote"] if branch else []) + ["remote.pushDefault"] \
+            + ([f"branch.{branch}.remote"] if branch else []):
+        value = run(["git", "config", "--get", key], cwd)
+        if value:
+            return value
+    return "origin"
+
+
+def push_is_public(push: re.Match, cwd: str) -> bool:
+    positional = [t for t in push.group(1).split() if not t.startswith("-")]
+    remote = positional[0] if positional else default_push_remote(cwd)
+    if ":" in remote or "/" in remote:
+        url = remote  # pushing straight to a URL
+    else:
+        url = run(["git", "remote", "get-url", "--push", remote], cwd)
+    if url is None:
+        return True  # unknown remote -> assume public
+    return visibility_is_public([url], cwd)
+
+
+def destination_is_public(command: str, cwd: str) -> bool:
+    if "--public" in command or MAKE_PUBLIC.search(command):
+        return True
+    if any(push_is_public(push, cwd) for push in GIT_PUSH.finditer(command)):
+        return True
+    if RELEASE_CREATE.search(command):
+        repo_flag = REPO_FLAG.search(command)
+        return visibility_is_public([repo_flag.group(1)] if repo_flag else [], cwd)
+    return False  # a repo or gist created without --public is private or secret
+
+
+def unseen_content(command: str) -> str | None:
+    """A publishing command whose content this hook cannot scan."""
+    if MAKE_PUBLIC.search(command) and REPO_FLAG.search(command):
+        return "a visibility change on a repository named by --repo"
+    if GIST_CREATE.search(command) or RELEASE_CREATE.search(command):
+        return "a gist or release publishes files this hook does not scan"
+    return None
 
 
 def block(reason: str) -> int:
@@ -85,28 +172,63 @@ def block(reason: str) -> int:
     return 2
 
 
-def scan(root: str, patterns: list[re.Pattern]) -> list[tuple] | None:
-    listing = run(["git", "ls-files", "-z", "--cached", "--others",
-                   "--exclude-standard"], root)
-    if listing is None:
-        return None  # caller blocks: an unlistable tree is an unscanned tree
-    hits = []
-    for rel in filter(None, listing.split("\0")):
-        path = Path(root) / rel
-        if path.suffix.lower() in BINARY_SUFFIXES:
+def first_rule(text: str, patterns: list[re.Pattern]) -> int | None:
+    for number, pat in enumerate(patterns, 1):
+        if pat.search(text):
+            return number
+    return None
+
+
+def match_lines(source: str, text: str, patterns: list[re.Pattern],
+                hits: list[tuple], added_only: bool = False) -> None:
+    for n, line in enumerate(text.splitlines(), 1):
+        if added_only and not (line.startswith("+") and not line.startswith("+++")):
             continue
+        number = first_rule(line, patterns)
+        if number:
+            hits.append((source, n, number))
+
+
+def scan(root: str, patterns: list[re.Pattern], include_ignored: bool,
+         whole_history: bool):
+    """Return (hits, unscannable), or None when what would ship cannot be listed."""
+    listing_args = ["git", "ls-files", "-z", "--cached", "--others"]
+    if not include_ignored:
+        listing_args.append("--exclude-standard")
+    listing = run(listing_args, root)
+    staged = run(["git", "diff", "--cached", "--text", "--no-color", "-U0"], root)
+    if listing is None or staged is None:
+        return None
+    history = ""
+    if run(["git", "rev-parse", "--verify", "-q", "HEAD"], root) is not None:
+        outgoing = ["--all"] if whole_history else ["--branches", "--tags", "--not", "--remotes"]
+        history = run(["git", "log", "-p", "--text", "--no-color", "-U0", "--format=",
+                       *outgoing], root)
+        if history is None:
+            return None
+
+    hits, unscannable = [], []
+    for rel in sorted(set(filter(None, listing.split("\0")))):
+        number = first_rule(rel, patterns)
+        if number:
+            hits.append(("(a file name)", 0, number))
+        path = Path(root) / rel
         try:
             if path.stat().st_size > MAX_FILE_BYTES:
+                unscannable.append(rel)
                 continue
-            text = path.read_text(errors="ignore")
+            data = path.read_bytes()
         except OSError:
+            unscannable.append(rel)
             continue
-        for n, line in enumerate(text.splitlines(), 1):
-            for pat in patterns:
-                if pat.search(line):
-                    hits.append((rel, n, pat.pattern, line.strip()[:90]))
-                    break
-    return hits
+        match_lines(rel, data.decode("latin-1"), patterns, hits)
+    match_lines("(staged changes)", staged, patterns, hits, added_only=True)
+    match_lines("(unpushed commits)", history, patterns, hits, added_only=True)
+    return hits, unscannable
+
+
+def shown(path: str, patterns: list[re.Pattern]) -> str:
+    return "(a file name)" if first_rule(path, patterns) else path
 
 
 def main() -> int:
@@ -114,18 +236,28 @@ def main() -> int:
         payload = json.load(sys.stdin)
     except Exception:
         return block("hook payload was not valid JSON")
-    if payload.get("tool_name") != "Bash":
+    if not isinstance(payload, dict) or not isinstance(payload.get("tool_name"), str):
+        return block("hook payload is not a tool event")
+    if payload["tool_name"] != "Bash":
         return 0
-    command = (payload.get("tool_input") or {}).get("command", "")
-    if not any(p.search(command) for p in PUBLISH_PATTERNS):
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return block("hook payload has no command string")
+    publishes = [m for p in PUBLISH_PATTERNS for m in [p.search(command)] if m]
+    if not publishes:
         return 0
 
-    cwd = payload.get("cwd") or os.getcwd()
+    first = min(publishes, key=lambda m: m.start())
+    cwd = repository_dir(command, first, payload.get("cwd") or os.getcwd())
     root = run(["git", "rev-parse", "--show-toplevel"], cwd)
     if root is None:
-        return block("could not resolve the repository root from the working directory")
+        return block("could not resolve the repository that would be published")
     if not destination_is_public(command, cwd):
         return 0
+    reason = unseen_content(command)
+    if reason:
+        return block(f"{reason}; review it and run it yourself")
 
     try:
         terms = load_terms()
@@ -133,19 +265,25 @@ def main() -> int:
         return block(f"could not load the term file: {exc}")
     if not terms:
         return block("the term file is empty; an empty scan is not a clean scan")
-    hits = scan(root, terms)
-    if hits is None:
-        return block("could not list the files that would ship")
+    result = scan(root, terms, include_ignored=bool(FORCE_ADD.search(command)),
+                  whole_history=bool(MAKE_PUBLIC.search(command)))
+    if result is None:
+        return block("could not list the files and commits that would ship")
+    hits, unscannable = result
+    if unscannable:
+        names = [shown(rel, terms) for rel in unscannable[:10]]
+        return block(f"{len(unscannable)} file(s) could not be scanned: " + ", ".join(names))
     if not hits:
         return 0
 
-    print(f"BLOCKED: public destination, and the tree contains private data.\n"
-          f"{len(hits)} match(es):\n", file=sys.stderr)
-    for rel, n, pattern, snippet in hits[:40]:
-        print(f"  {rel}:{n}\n      matched /{pattern}/\n      {snippet}",
-              file=sys.stderr)
-    print("\nDo not add an exclusion. Remove the content, or move it out of the "
-          "repository and ignore its path, then retry.", file=sys.stderr)
+    print(f"BLOCKED: public destination, and the push carries private data.\n"
+          f"{len(hits)} match(es) (file:line, rule number in the term file):\n",
+          file=sys.stderr)
+    for source, n, number in hits[:40]:
+        print(f"  {shown(source, terms)}:{n}  (rule {number})", file=sys.stderr)
+    print("\nDo not add an exclusion. Remove the content (and from any unpushed "
+          "commit), or move it out of the repository and ignore its path, then "
+          "retry.", file=sys.stderr)
     return 2
 
 

@@ -1,6 +1,6 @@
 ---
 skill: example-workflow
-lessons: lesson-verify-before-claiming, lesson-scope-before-plan
+lessons: lesson-verify-before-claiming
 updated: 2026-01-01
 ---
 
@@ -34,6 +34,7 @@ order, so the first screen has to carry the rules that matter.
 ## Applied
 
 Append the date each time a rule above changed what was done. Three or more across different
-situations promotes the rule to the adapter; none in sixty days prunes it.
+situations promotes the rule to the adapter; none in sixty days prunes it, unless a dated `keep:`
+line records why it stays.
 
 applied: 2026-01-01

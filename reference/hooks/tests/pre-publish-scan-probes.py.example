@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+# covers: pre-publish-scan.py.example
+"""EXAMPLE probe suite for the publication gate. Runnable: this repository's CI runs it.
+
+Three rules it demonstrates:
+
+  * The case list starts with what the gate must BLOCK and what it must stay
+    QUIET on, not with what the code happens to do. A gate that blocks
+    everything passes every "must block" case; the quiet cases catch that.
+
+  * Every case runs the hook as a separate process, fed JSON on stdin, against
+    a throwaway repository and a stub `gh` on PATH. Nothing touches the real
+    home directory, the real repository, or the network.
+
+  * A suite is only evidence if breaking the hook turns it red. Each mutation
+    below edits a copy of the hook; at least one case must then fail. A
+    mutation that no case notices is a SURVIVOR (a real gap, or an equivalent
+    mutant to retire with the reason written down). A mutation whose target
+    text no longer exists is STALE: the hook changed and the suite did not.
+
+Run: python3 reference/hooks/tests/pre-publish-scan-probes.py.example
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOK = HERE.parent / "pre-publish-scan.py.example"
+TERMS = HERE.parent / "private-terms.txt.example"
+
+LEAK = "Our office is in Exampleville.\n"
+CLEAN = "Nothing private here.\n"
+TOKEN = "gh" + "p_" + "Z" * 36  # built at runtime so this file carries no token shape
+PRIVATE_URL = "https://github.com/example/private-repo"
+PUBLIC_URL = "https://github.com/example/public-repo"
+
+GH_STUB = """#!/bin/sh
+# gh repo view [target] --json visibility --jq .visibility
+case "$GH_STUB" in
+  PUBLIC) echo PUBLIC ;;
+  PRIVATE) echo PRIVATE ;;
+  BYURL) case "$3" in
+           *public*) echo PUBLIC ;;
+           *private*) echo PRIVATE ;;
+           *) exit 1 ;;
+         esac ;;
+  *) exit 1 ;;
+esac
+"""
+
+
+def git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=probe",
+                    "-c", "user.email=probe@example.com", *args], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def make_repo(base: Path, name: str, tracked: dict, untracked: dict | None = None,
+              ignore: str | None = None) -> Path:
+    repo = base / name
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "remote", "add", "origin", PRIVATE_URL)
+    if ignore is not None:
+        (repo / ".gitignore").write_text(ignore)
+    for rel, text in tracked.items():
+        (repo / rel).write_text(text)
+        git(repo, "add", rel)
+    for rel, text in (untracked or {}).items():
+        (repo / rel).write_text(text)
+    return repo
+
+
+def install_hook(base: Path, hook_source: str, terms_text: str) -> Path:
+    hook_dir = base / "hook"
+    hook_dir.mkdir()
+    (hook_dir / "pre-publish-scan.py").write_text(hook_source)
+    (hook_dir / "private-terms.txt.example").write_text(terms_text)
+    stub_dir = base / "bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    stub.write_text(GH_STUB)
+    stub.chmod(0o755)
+    return hook_dir / "pre-publish-scan.py"
+
+
+def run_hook(hook: Path, stdin: str, gh_mode: str) -> tuple[int, str]:
+    env = dict(os.environ)
+    env["PATH"] = str(hook.parent.parent / "bin") + os.pathsep + env.get("PATH", "")
+    env["GH_STUB"] = gh_mode
+    env["HOME"] = str(hook.parent.parent)  # never the real home
+    result = subprocess.run([sys.executable, str(hook)], input=stdin, text=True,
+                            capture_output=True, env=env, timeout=60)
+    return result.returncode, result.stdout + result.stderr
+
+
+def payload(command: str, cwd: Path) -> str:
+    return json.dumps({"tool_name": "Bash", "tool_input": {"command": command},
+                       "cwd": str(cwd)})
+
+
+def case(stdin: str, gh: str = "PUBLIC", empty_terms: bool = False,
+         must_not_print: str | None = None) -> dict:
+    return {"stdin": stdin, "gh": gh, "empty_terms": empty_terms,
+            "must_not_print": must_not_print}
+
+
+# Each builder gets a scratch directory and returns a case(...).
+
+def case_not_a_publish(base):
+    return case(payload("git status", make_repo(base, "r", {"a.md": LEAK})))
+
+
+def case_malformed_payload(base):
+    return case("this is not json")
+
+
+def case_incomplete_payload(base):
+    return case(json.dumps({"tool_name": "Bash"}))
+
+
+def case_quiet_clean_public(base):
+    return case(payload("gh repo edit --visibility public", make_repo(base, "r", {"a.md": CLEAN})))
+
+
+def case_tracked_leak(base):
+    return case(payload("git push origin main", make_repo(base, "r", {"a.md": LEAK})))
+
+
+def case_untracked_leak(base):
+    repo = make_repo(base, "r", {"a.md": CLEAN}, untracked={"notes.md": LEAK})
+    return case(payload("git add -A && git commit -m x && git push", repo))
+
+
+def case_quiet_ignored_leak(base):
+    repo = make_repo(base, "r", {"a.md": CLEAN}, untracked={"secret.txt": LEAK},
+                     ignore="secret.txt\n")
+    return case(payload("git push origin main", repo))
+
+
+def case_force_added_ignored_leak(base):
+    repo = make_repo(base, "r", {"a.md": CLEAN}, untracked={"secret.txt": LEAK},
+                     ignore="secret.txt\n")
+    return case(payload("git add -f secret.txt && git commit -m x && git push origin main", repo))
+
+
+def case_leak_only_in_unpushed_history(base):
+    repo = make_repo(base, "r", {"a.md": LEAK})
+    git(repo, "commit", "-q", "-m", "add")
+    (repo / "a.md").write_text(CLEAN)
+    git(repo, "commit", "-q", "-am", "clean up")
+    return case(payload("git push origin main", repo))
+
+
+def case_leak_only_in_the_index(base):
+    repo = make_repo(base, "r", {"a.md": LEAK})
+    (repo / "a.md").write_text(CLEAN)  # working copy clean, staged copy is not
+    return case(payload("git commit -m x && git push origin main", repo))
+
+
+def case_unscannable_file(base):
+    repo = make_repo(base, "r", {"a.md": CLEAN}, untracked={"big.log": "a" * 2_000_001})
+    return case(payload("git push origin main", repo))
+
+
+def case_leak_in_a_binary_suffix(base):
+    repo = make_repo(base, "r", {"a.md": CLEAN}, untracked={"scan.pdf": "%PDF\n" + LEAK})
+    return case(payload("git push origin main", repo))
+
+
+def case_report_does_not_echo_the_secret(base):
+    repo = make_repo(base, "r", {"config.md": f"token = {TOKEN}\n"})
+    return case(payload("git push origin main", repo), must_not_print=TOKEN)
+
+
+def case_not_a_repository(base):
+    plain = base / "plain"
+    plain.mkdir()
+    return case(payload("git push origin main", plain))
+
+
+def case_empty_term_file(base):
+    return case(payload("git push origin main", make_repo(base, "r", {"a.md": LEAK})),
+                empty_terms=True)
+
+
+def case_quiet_private_origin(base):
+    return case(payload("git push origin main", make_repo(base, "r", {"a.md": LEAK})), gh="BYURL")
+
+
+def case_push_url_differs_from_fetch_url(base):
+    repo = make_repo(base, "r", {"a.md": LEAK})
+    git(repo, "remote", "set-url", "--push", "origin", PUBLIC_URL)
+    return case(payload("git push origin main", repo), gh="BYURL")
+
+
+def case_unknown_remote_is_public(base):
+    return case(payload("git push mirror main", make_repo(base, "r", {"a.md": LEAK})), gh="PRIVATE")
+
+
+def case_unresolved_visibility_is_public(base):
+    return case(payload("git push origin main", make_repo(base, "r", {"a.md": LEAK})), gh="FAIL")
+
+
+def case_dash_c_scans_the_named_repository(base):
+    clean = make_repo(base, "clean", {"a.md": CLEAN})
+    make_repo(base, "leaky", {"a.md": LEAK})
+    return case(payload("git -C ../leaky push origin main", clean))
+
+
+def case_cd_scans_the_named_repository(base):
+    clean = make_repo(base, "clean", {"a.md": CLEAN})
+    make_repo(base, "leaky", {"a.md": LEAK})
+    return case(payload("cd ../leaky && git push origin main", clean))
+
+
+def case_quiet_private_repo_create(base):
+    repo = make_repo(base, "r", {"a.md": LEAK})
+    return case(payload("gh repo create example --private --source .", repo), gh="FAIL")
+
+
+def case_public_repo_create(base):
+    repo = make_repo(base, "r", {"a.md": LEAK})
+    return case(payload("gh repo create example --public --source . --push", repo), gh="FAIL")
+
+
+def case_non_object_payload(base):
+    return case("[]")
+
+
+def case_empty_object_payload(base):
+    return case("{}")
+
+
+def case_make_public_with_leak(base):
+    return case(payload("gh repo edit --visibility public", make_repo(base, "r", {"a.md": LEAK})))
+
+
+def pushed_history_with_leak(base) -> Path:
+    repo = make_repo(base, "r", {"a.md": LEAK})
+    git(repo, "commit", "-q", "-m", "add")
+    (repo / "a.md").write_text(CLEAN)
+    git(repo, "commit", "-q", "-am", "clean up")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")  # as if already pushed
+    return repo
+
+
+def case_make_public_scans_pushed_history(base):
+    return case(payload("gh repo edit --visibility public", pushed_history_with_leak(base)))
+
+
+def case_quiet_normal_push_skips_pushed_history(base):
+    return case(payload("git push origin main", pushed_history_with_leak(base)))
+
+
+def case_second_push_is_checked(base):
+    repo = make_repo(base, "r", {"a.md": LEAK})
+    git(repo, "remote", "add", "mirror", PUBLIC_URL)
+    return case(payload("git push origin main && git push mirror main", repo), gh="BYURL")
+
+
+def case_quiet_bare_push_to_private(base):
+    return case(payload("git push", make_repo(base, "r", {"a.md": LEAK})), gh="BYURL")
+
+
+def case_bare_push_uses_push_default(base):
+    repo = make_repo(base, "r", {"a.md": LEAK})
+    git(repo, "remote", "add", "mirror", PUBLIC_URL)
+    git(repo, "config", "remote.pushDefault", "mirror")
+    return case(payload("git push", repo), gh="BYURL")
+
+
+def case_staged_binary_leak(base):
+    repo = base / "r"
+    make_repo(base, "r", {"a.md": CLEAN})
+    (repo / "blob.bin").write_bytes(b"\x00\x01" + LEAK.encode())
+    git(repo, "add", "blob.bin")
+    (repo / "blob.bin").write_bytes(b"\x00\x01clean")
+    return case(payload("git commit -m x && git push origin main", repo))
+
+
+def case_private_file_name(base):
+    repo = make_repo(base, "r", {"a.md": CLEAN},
+                     untracked={"Exampleville-notes.txt": "Exampleville\n"})
+    return case(payload("git push origin main", repo), must_not_print="Exampleville")
+
+
+def case_private_name_on_a_clean_file(base):
+    repo = make_repo(base, "r", {"a.md": CLEAN}, untracked={"Exampleville-notes.txt": CLEAN})
+    return case(payload("git push origin main", repo))
+
+
+def case_public_gist_is_not_scannable(base):
+    return case(payload("gh gist create --public a.md", make_repo(base, "r", {"a.md": CLEAN})))
+
+
+def case_visibility_change_on_another_repo(base):
+    repo = make_repo(base, "r", {"a.md": CLEAN})
+    return case(payload("gh repo edit --repo example/other --visibility public", repo))
+
+
+def case_repo_create_scans_its_source(base):
+    clean = make_repo(base, "clean", {"a.md": CLEAN})
+    make_repo(base, "leaky", {"a.md": LEAK})
+    return case(payload("gh repo create example --public --source ../leaky --push", clean))
+
+
+CASES = (
+    ("not a publish command", 0, case_not_a_publish),
+    ("malformed payload blocks", 2, case_malformed_payload),
+    ("payload without a command blocks", 2, case_incomplete_payload),
+    ("QUIET: clean tree, public destination", 0, case_quiet_clean_public),
+    ("tracked leak blocks", 2, case_tracked_leak),
+    ("untracked leak in the same command blocks", 2, case_untracked_leak),
+    ("QUIET: ignored file cannot ship", 0, case_quiet_ignored_leak),
+    ("force-added ignored file blocks", 2, case_force_added_ignored_leak),
+    ("leak only in an unpushed commit blocks", 2, case_leak_only_in_unpushed_history),
+    ("leak only in the staged index blocks", 2, case_leak_only_in_the_index),
+    ("file over the size cap blocks", 2, case_unscannable_file),
+    ("leak in a binary-suffix file blocks", 2, case_leak_in_a_binary_suffix),
+    ("report does not echo the secret", 2, case_report_does_not_echo_the_secret),
+    ("not a repository blocks", 2, case_not_a_repository),
+    ("empty term file blocks", 2, case_empty_term_file),
+    ("QUIET: private push destination", 0, case_quiet_private_origin),
+    ("push URL differing from fetch URL is checked", 2, case_push_url_differs_from_fetch_url),
+    ("unknown remote is treated as public", 2, case_unknown_remote_is_public),
+    ("unresolved visibility is treated as public", 2, case_unresolved_visibility_is_public),
+    ("git -C scans the named repository", 2, case_dash_c_scans_the_named_repository),
+    ("cd && push scans the named repository", 2, case_cd_scans_the_named_repository),
+    ("QUIET: creating a private repository", 0, case_quiet_private_repo_create),
+    ("creating a public repository with a leak blocks", 2, case_public_repo_create),
+    ("JSON that is not an object blocks", 2, case_non_object_payload),
+    ("empty JSON object blocks", 2, case_empty_object_payload),
+    ("making a repository public with a leak blocks", 2, case_make_public_with_leak),
+    ("making a repository public scans pushed history", 2, case_make_public_scans_pushed_history),
+    ("QUIET: a normal push skips already-pushed history", 0, case_quiet_normal_push_skips_pushed_history),
+    ("a second push in the same command is checked", 2, case_second_push_is_checked),
+    ("QUIET: a bare push to a private remote", 0, case_quiet_bare_push_to_private),
+    ("a bare push follows remote.pushDefault", 2, case_bare_push_uses_push_default),
+    ("a staged binary blob with a leak blocks", 2, case_staged_binary_leak),
+    ("a private file name blocks and is not echoed", 2, case_private_file_name),
+    ("a private name on a clean file blocks", 2, case_private_name_on_a_clean_file),
+    ("a public gist is blocked as unscannable", 2, case_public_gist_is_not_scannable),
+    ("making another repository public is blocked", 2, case_visibility_change_on_another_repo),
+    ("repo create scans its --source directory", 2, case_repo_create_scans_its_source),
+)
+
+MUTATIONS = (
+    ("scan tracked files only", '"--cached", "--others"]', '"--cached"]'),
+    ("scan ignored files always", "if not include_ignored:", "if False:"),
+    ("force-add not detected", "include_ignored=bool(FORCE_ADD.search(command))", "include_ignored=False"),
+    ("malformed payload allowed", 'return block("hook payload was not valid JSON")', "return 0"),
+    ("incomplete payload allowed", 'return block("hook payload has no command string")', "return 0"),
+    ("unresolved visibility assumed private", "return True  # unresolved", "return False  # unresolved"),
+    ("unknown remote assumed private", "return True  # unknown remote", "return False  # unknown remote"),
+    ("fetch URL checked instead of push URL", '"get-url", "--push", remote', '"get-url", remote'),
+    ("empty term file allowed", "if not terms:", "if False:"),
+    ("unpushed history not scanned", 'match_lines("(unpushed commits)", history', 'match_lines("(unpushed commits)", ""'),
+    ("staged index not scanned", 'match_lines("(staged changes)", staged', 'match_lines("(staged changes)", ""'),
+    ("unscannable files allowed", "    if unscannable:\n", "    if False:\n"),
+    ("binary-suffix files skipped", "data = path.read_bytes()", 'data = b"" if rel.endswith(".pdf") else path.read_bytes()'),
+    ("report echoes the matched line", "hits.append((source, n, number))", "hits.append((source, n, line))"),
+    ("git -C ignored", "    if other_dir:\n", "    if False:\n"),
+    ("cd ignored", "CD_STEP.finditer(command[:first_publish.start()])", 'CD_STEP.finditer("")'),
+    ("push pattern requires adjacent words",
+     r're.compile(r"\bgit\b[^;&|\n]*?\spush\b([^;&|\n]*)")', r're.compile(r"\bgit\s+push\b([^;&|\n]*)")'),
+    ("public repo create not matched", "(GIT_PUSH, REPO_CREATE, GIST_CREATE,", "(GIT_PUSH, GIST_CREATE,"),
+    ("visibility change not matched", "RELEASE_CREATE, MAKE_PUBLIC)", "RELEASE_CREATE)"),
+    ("non-object payload allowed", 'return block("hook payload is not a tool event")', "return 0"),
+    ("only the first push checked", "for push in GIT_PUSH.finditer(command))",
+     "for push in list(GIT_PUSH.finditer(command))[:1])"),
+    ("bare push assumes origin", "else default_push_remote(cwd)", 'else "origin"'),
+    ("visibility change scans only unpushed commits",
+     "whole_history=bool(MAKE_PUBLIC.search(command))", "whole_history=False"),
+    ("every push scans all history",
+     'outgoing = ["--all"] if whole_history else', 'outgoing = ["--all"] if True else'),
+    ("binary diffs hidden", '"git", "diff", "--cached", "--text",', '"git", "diff", "--cached",'),
+    ("file names not scanned", "number = first_rule(rel, patterns)", "number = None"),
+    ("file name echoed", 'return "(a file name)" if first_rule(path, patterns) else path', "return path"),
+    ("unscannable publish commands allowed", "    if reason:\n", "    if False:\n"),
+    ("--source ignored", "if REPO_CREATE.match(command, first_publish.start()) and source:", "if False:"),
+)
+
+
+def run_cases(hook_source: str, stop_at_first_failure: bool = False) -> list[tuple[str, bool, str]]:
+    results = []
+    terms_text = TERMS.read_text()
+    for name, expected, builder in CASES:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            try:
+                spec = builder(base)
+                hook = install_hook(base, hook_source, "" if spec["empty_terms"] else terms_text)
+                code, output = run_hook(hook, spec["stdin"], spec["gh"])
+                echoed = bool(spec["must_not_print"]) and spec["must_not_print"] in output
+                ok = code == expected and not echoed
+                detail = f"expected {expected}, got {code}" + ("; secret echoed" if echoed else "")
+                results.append((name, ok, detail))
+                if stop_at_first_failure and not ok:
+                    break
+            except Exception as exc:  # a crash is a failure, never silence
+                results.append((name, False, f"harness error: {exc!r}"))
+    return results
+
+
+def main() -> int:
+    if shutil.which("git") is None:
+        print("FAIL: git is required", file=sys.stderr)
+        return 1
+    source = HOOK.read_text()
+    failed = 0
+
+    print("Cases against the hook as written:")
+    for name, ok, detail in run_cases(source):
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"  ({detail})"))
+        failed += not ok
+
+    print("Mutations (each must turn at least one case red):")
+    for label, old, new in MUTATIONS:
+        if source.count(old) != 1:
+            print(f"  STALE     {label}  (target text found {source.count(old)} times)")
+            failed += 1
+            continue
+        red = [name for name, ok, _ in run_cases(source.replace(old, new), True) if not ok]
+        if red:
+            print(f"  KILLED    {label}  by: {red[0]}")
+        else:
+            print(f"  SURVIVED  {label}")
+            failed += 1
+
+    total = len(CASES) + len(MUTATIONS)
+    print(f"{total - failed}/{total} checks passed.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

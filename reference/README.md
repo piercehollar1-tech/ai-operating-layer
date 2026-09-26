@@ -10,12 +10,15 @@ reference/
 │   ├── CLAUDE.md.example
 │   └── output-style.md.example
 ├── agents/
+│   ├── task-packet.md.example
 │   └── worker.md.example
 ├── hooks/
 │   ├── README.md
 │   ├── pre-publish-scan.py.example
 │   ├── private-terms.txt.example
-│   └── routes.json.example
+│   ├── routes.json.example
+│   └── tests/
+│       └── pre-publish-scan-probes.py.example
 └── shared/
     ├── QUICK_CONTEXT.md
     ├── TODAY.md
@@ -43,6 +46,14 @@ definition, and a system-prompt style are client-specific and do not port betwee
 when the context beneath them is shared. See [../docs/enforcement.md](../docs/enforcement.md),
 [../docs/delegation.md](../docs/delegation.md), and
 [../docs/response-contract.md](../docs/response-contract.md).
+
+`hooks/tests/` holds a probe suite for the example publication hook: a `# covers:` line, quiet
+cases, the inputs the hook exists to catch, and mutations that must each turn a case red. Unlike
+the rest of this directory it is runnable, and CI runs it. See
+[../docs/verification.md](../docs/verification.md).
+
+`agents/task-packet.md.example` is a filled-in packet for a delegated worker; the worker
+definition beside it is the agent that receives one.
 
 `shared/skill-notes/` is the per-skill operational memory the preflight hook injects on
 invocation; `shared/memory/feedback_lesson-example.md` shows a lesson with its `applied:` line.

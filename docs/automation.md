@@ -75,7 +75,7 @@ A layer that does not learn accumulates instead. The difference is whether new k
 
 **Route at write time, not at cleanup time.** A log with a "we'll sort this later" policy becomes a store. Give each entry a mandatory destination when it is written, and drain it in the same edit that promotes it. This keeps the always-loaded set structurally small rather than periodically trimmed.
 
-**Promote on evidence, prune on silence.** A pattern that has proved itself several times across different situations earns a place in the always-loaded rules. One that has not been used in months should be deleted rather than preserved out of politeness to your past self.
+**Promote on evidence, prune on silence.** A pattern that has proved itself several times across different situations earns a place in the always-loaded rules. One that has not been used in months should be deleted rather than preserved out of politeness to your past self, unless it carries a dated `keep:` line saying why (see [context delivery](context-delivery.md#evidence-based-promotion-and-pruning)).
 
 **A ceiling tells you when to panic; a routing table tells you where things go.** If a file keeps hitting its size cap, the cap is not the problem — the absence of destinations is.
 
@@ -101,6 +101,18 @@ Memories in drift-prone, actable categories carry a confidence and a source: ver
 ### Rejected, on measurement
 
 A knowledge graph over the vault was evaluated and rejected: typed edges and per-fact provenance are genuinely stronger than untyped wiki-links, but the extraction pass that builds them has a published F1 in the mid-0.6s, and running a lossy extraction over an already-curated corpus trades accuracy for machinery. The two portable ideas were taken instead: a small, measured alias map for the search index (added only when both forms occur in the corpus and an A/B shows no rank regression), and per-fact provenance enforced forward from a date rather than backfilled by guessing.
+
+## The audit
+
+A read-only audit is what makes drift visible between sessions. It checks every layer above for broken pointers, orphaned files, stale heartbeats, oversized append targets, lessons due for promotion or pruning, unrecognized scheduled jobs, outdated tools, and hooks or checkers without a probe suite.
+
+**Two speeds.** A cheap sentinel runs at session start and surfaces findings; a deep pass runs on demand and adds judgment. The sentinel must never delay the session: it prints the previous run's saved result, marked with its age, and refreshes in the background. Findings arrive one session late, which is a good trade for a zero-second start.
+
+**A finding leaves the audit in one of three ways**: fixed, routed to the store that owns it, or converted into a mechanical check. "Noted" is not one of them; a finding that was noted will be found again next month, by someone with less context.
+
+**Accepted findings are dismissed with a reason and an expiry, and stay listed.** The dismissal store and its failure modes are in [verification](verification.md#coverage-and-freshness-are-audited-not-assumed).
+
+**Measure before you redraft.** When an audit shows a rule being ignored, bring the compliance rate first, then fix the layer the rule lives in (delivery at the tool call beats a question at the irreversible moment, which beats prose), never just its wording. And sample the sessions a gate fired in before calling it ignored.
 
 ## Verification, as a habit and then as a control
 

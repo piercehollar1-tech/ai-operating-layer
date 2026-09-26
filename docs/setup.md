@@ -22,6 +22,7 @@ The user-level instruction file is normally `~/.claude/CLAUDE.md`. Project-speci
 2. Replace `your_private_shared_root` with the private absolute path.
 3. Merge it into the appropriate user or project instruction file.
 4. Use Claude Code’s `/memory` view to confirm which instruction and memory files actually loaded.
+5. Keep the adapter's "when instructions conflict" section: once skills, notes, and memory exist, they will disagree, and the order has to be written down before that happens.
 
 Claude Code also supports per-project auto memory. If you use it, keep its `MEMORY.md` concise and decide deliberately whether it is the canonical memory store or merely a client-local supplement. Do not create two competing sources of truth by accident.
 
@@ -33,6 +34,7 @@ The global instruction file is normally `~/.codex/AGENTS.md`, unless `CODEX_HOME
 2. Replace `your_private_shared_root` with the private absolute path.
 3. Merge it into the global file.
 4. Start a fresh Codex run and test that it can locate the shared root and follow one harmless adapter rule.
+5. Keep the same "when instructions conflict" section as the Claude Code adapter, so both clients settle a conflict the same way.
 
 Keep repository-specific commands and conventions in that repository’s `AGENTS.md`, not in the global adapter.
 
@@ -64,7 +66,9 @@ This verifies the behavior, not merely the presence of files.
 Only after the manual loop works. Start with the two whose failure is worst, not the two that are
 easiest:
 
-1. **A publication gate** on anything crossing from private to public.
+1. **A publication gate** on anything crossing from private to public, in two layers: an
+   agent-side hook before the command, and git's own `pre-push` hook, which sees the exact
+   commits being pushed.
 2. **A credential guard** blocking reads of secret paths and environment dumps.
 
 For each one, before trusting it: construct the input it exists to catch and confirm it blocks.
@@ -100,9 +104,12 @@ Only after the controls above are proven:
 - the reply contract as an output style in the system prompt, with a Stop hook that measures
   every reply and a prompt hook that reports the score ([response contract](response-contract.md));
 - the delegation gate, with the dispatch-contract and delegate-first hooks
-  ([delegation](delegation.md));
-- probe suites for every blocking gate, run by a Stop hook after any hook edit
-  ([verification](verification.md)).
+  ([delegation](delegation.md)), and a task-packet template
+  ([example](../reference/agents/task-packet.md.example));
+- probe suites for every blocking gate, run by a Stop hook after any hook edit, with an audit
+  check that every hook and checker has one and that the suites ran recently
+  ([verification](verification.md); a runnable example is in
+  [`reference/hooks/tests/`](../reference/hooks/tests/pre-publish-scan-probes.py.example)).
 
 For each one, take the baseline measurement first. A rule with no count is a suggestion, and the
 count is what tells you whether the wiring worked.
@@ -116,6 +123,8 @@ Before publishing changes derived from a private installation:
   **whole tree with nothing excluded**, and over untracked files as well as tracked ones;
 - confirm no live `CLAUDE.md`, `AGENTS.md`, database, transcript, or local settings file is staged;
 - confirm every example is fictional;
+- pin line endings in `.gitattributes` if the repository ships scripts or hooks
+  ([operating pitfalls](operations.md));
 - verify all Markdown links resolve;
 - review the rendered repository on GitHub.
 

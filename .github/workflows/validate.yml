@@ -14,13 +14,19 @@ jobs:
   validate:
     name: Validate public reference
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Run repository validator
         run: python3 scripts/validate_repository.py
+
+      - name: Break-test the validator
+        run: python3 scripts/test_validate_repository.py
+
+      - name: Run the example hook's probe suite
+        run: python3 reference/hooks/tests/pre-publish-scan-probes.py.example

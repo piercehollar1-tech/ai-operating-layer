@@ -2,15 +2,16 @@
 
 Fictional examples showing the shape of a control layer. Concepts are in [../../docs/enforcement.md](../../docs/enforcement.md).
 
-Nothing here is wired up. Adapt it to your client's hook mechanism, replace every fictional term, and test each control by breaking it on purpose before trusting it.
+Nothing here is wired up, except that CI runs the probe suite against the example hook. Adapt it to your client's hook mechanism, replace every fictional term, and test each control by breaking it on purpose before trusting it.
 
 ## Files
 
 | File | What it demonstrates |
 |---|---|
-| `pre-publish-scan.py.example` | Blocking a publish to a public destination when the tree carries private data. Fails closed, scans untracked as well as tracked files, has no exclude list. |
+| `pre-publish-scan.py.example` | Blocking a publish to a public destination when the tree carries private data. The agent-side layer: scans file names and contents, the staged index, and local commits no remote has; checks each push's real destination; fails closed; has no exclude list; never echoes the match. Its docstring lists what it cannot see, which is why a git `pre-push` hook is the second layer. |
 | `private-terms.txt.example` | The shape of a term file — and why it must live outside any published tree. |
 | `routes.json.example` | A routing table for a pre-tool nudge: fires the adapter's routing pointers at the tool call, as added context only. |
+| `tests/pre-publish-scan-probes.py.example` | The publication hook's probe suite. Runnable (CI runs it): throwaway repositories, a stub `gh` on `PATH`, quiet cases, and mutations that must each be caught. |
 
 ## Lifecycle map
 
@@ -44,3 +45,13 @@ Hook point names vary by client. These categories do not. A layer that only logs
 **Give every gate a probe suite with a `# covers:` line, and run all suites from a Stop hook after any edit under the hooks directory.** Coverage declared, not inferred; a stale declaration reads as uncovered. See [../../docs/verification.md](../../docs/verification.md).
 
 **Probe with the home directory redirected.** A hook run by hand really writes to its logs and state. One writer per event; re-run the whole case list after each fix.
+
+**Match what the tool will really be given.** A publish gate that looked for `git push` missed `git -C <dir> push`, and scanned the working directory rather than the repository named by `-C`. Global options, chained commands, and other remotes are the ordinary shapes of the input, not edge cases.
+
+**Assume hooks for one event run in parallel.** Order in the settings file conveys nothing. Never let two hooks rewrite the same tool input, and never let one depend on another having run first.
+
+**Use exec form for anything shipped to another machine.** A path placeholder substituted into a shell-form command is interpreted by the shell; exec form (an executable plus an argument list) is not.
+
+**Measure runtime against the timeout.** A hook killed by its timeout prints nothing and looks like a hook with nothing to say.
+
+**Never register a model-evaluated hook on user input live.** If the evaluator answers with anything but the exact no-op result, the user's message is blocked. Prove it in a headless run with temporary settings first.
