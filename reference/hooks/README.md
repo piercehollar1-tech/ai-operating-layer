@@ -8,10 +8,10 @@ Nothing here is wired up, except that CI runs the probe suite against the exampl
 
 | File | What it demonstrates |
 |---|---|
-| `pre-publish-scan.py.example` | Blocking a publish to a public destination when the tree carries private data. The agent-side layer: scans file names and contents, the staged index, and local commits no remote has; checks each push's real destination; fails closed; has no exclude list; never echoes the match. Its docstring lists what it cannot see, which is why a git `pre-push` hook is the second layer. |
+| `pre-publish-scan.py.example` | Blocking a publish to a public destination when it would carry private data. The agent-side layer: parses the command rather than grepping it; checks every push URL each publish really uses; scans file names and contents, the staged index, unpushed commits, commit messages, ref names, notes, symlink targets, and LFS objects; fails closed, including on its own crash; has no exclude list; never echoes the match. Its docstring lists what it cannot see, which is why a git `pre-push` hook is the second layer. |
 | `private-terms.txt.example` | The shape of a term file — and why it must live outside any published tree. |
 | `routes.json.example` | A routing table for a pre-tool nudge: fires the adapter's routing pointers at the tool call, as added context only. |
-| `tests/pre-publish-scan-probes.py.example` | The publication hook's probe suite. Runnable (CI runs it): throwaway repositories, a stub `gh` on `PATH`, quiet cases, and mutations that must each be caught. |
+| `tests/pre-publish-scan-probes.py.example` | The publication hook's probe suite. Runnable (CI runs it): throwaway repositories built once, a stub `gh` on `PATH`, a redirected home directory, quiet cases written the way real commands look, and mutations that must each be caught, run four at a time. |
 
 ## Lifecycle map
 

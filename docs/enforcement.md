@@ -104,6 +104,8 @@ Roughly fifty hook registrations across the surface above, in one installation. 
 
 When a control cannot evaluate its condition, it must block, not allow. A publication gate that cannot determine whether the destination is public should treat it as public. The cost of a false block is a moment of friction; the cost of a false allow is the thing the control exists to prevent.
 
+**A crash is a condition it could not evaluate.** Most clients treat any exit code other than the blocking one as "carry on", so an uncaught exception, a missing term file, or a hook killed by its own timeout fails open unless the hook catches it and blocks. Catch every exception around the decision, give the scan its own time budget below the client's timeout, and test each of those paths.
+
 ### Prove it by breaking it
 
 **A control is unproven until it has been observed failing on purpose.** Reading the code is not verification, and neither is a green run — a hook with an inverted condition passes every test where nothing is wrong.
@@ -153,17 +155,19 @@ The allowlist is strictly stronger, and the reason is not subtle: **a denylist o
 
 Both of these are stated as rules because both were discovered by a scan that reported clean while a leak sat inside the tree.
 
-**Scan what the push publishes, not just what is on disk.** A push carries every commit the remote does not have. A leak committed and then deleted in a later commit is gone from the working tree and still in the push; a staged copy can differ from the working copy. Scan the staged index and the added lines of every unpushed commit as well as the files.
+**Scan what the push publishes, not just what is on disk.** A push carries every commit the remote does not have. A leak committed and then deleted in a later commit is gone from the working tree and still in the push; a staged copy can differ from the working copy. Scan the staged index and the added lines of every unpushed commit as well as the files — and the parts of a push that are not file contents: commit messages, branch and tag names, tag messages, symlink targets, Git LFS objects, and any ref a mirror push or a configured refspec sends. Remote-tracking refs describe the repository you fetch from; only trust them to say what the target already has when the push URL is also the fetch URL.
 
-**Check the destination the push will use.** A remote's push URL can differ from its fetch URL, and a command can change directory (`cd dir && git push`, `git -C dir push`) before it pushes. Resolve the repository and the push URL from the command itself; anything that cannot be resolved is public.
+**Check the destination the push will use.** A remote's push URL can differ from its fetch URL, a remote can have several push URLs, an alias can name its own remote, and a command can change directory (`cd dir && git push`, `git -C dir push`) before it pushes. Resolve the repository and every push URL from the command itself; anything that cannot be resolved is public.
+
+**Parse the command; do not grep it.** A gate that matches the words `git push` blocks `git commit -m "ready to push"`, a note written with a heredoc that mentions a push, and `git push 2>&1` read as a push to a remote named `2>` — while missing a push inside `if … then`, inside a quoted `$(...)`, or behind an alias. Split the command into the commands the shell will run: respect quotes, follow `cd` and subshells, read `bash -c` and `eval` strings and heredocs fed to a shell, expand aliases, and skip heredocs that are only data. Where the nesting goes deeper than the parser follows, block. A gate that blocks ordinary work gets switched off, which is a fail-open with extra steps.
 
 **Never echo the match.** A report that prints the matched line, or the pattern that matched, copies the protected value into logs and the conversation. Report the file, the line, and a rule number.
 
-Two rounds of outside review found these gaps, and a dozen more, in earlier versions of the example hook in [`reference/hooks/`](../reference/hooks/pre-publish-scan.py.example), each after the hook's own probe suite had passed. Each is now a probe with a matching mutation.
+Four rounds of outside review found these gaps, and dozens more, in earlier versions of the example hook in [`reference/hooks/`](../reference/hooks/pre-publish-scan.py.example), each after the hook's own probe suite had passed. Each is now a probe with a matching mutation.
 
 ### Two layers, because a command string is not a push
 
-A gate that runs before the agent's shell command sees only the command text. It cannot see a file that an earlier step of the same command will create, and it parses shell with patterns that an alias, a script, or `eval` can slip past. Those limits are structural; more patterns do not close them. So the publication gate has two layers:
+A gate that runs before the agent's shell command sees only the command text. It cannot see a file that an earlier step of the same command will create, and it parses shell without running it, so a push inside a script file, a shell function, or a command built from variables can slip past. Those limits are structural; more patterns do not close them. So the publication gate has two layers:
 
 1. **The agent-side gate**, before the command runs: cheap, catches the ordinary shapes, and fails closed on what it cannot resolve.
 2. **Git's own `pre-push` hook**, which git runs with the exact local and remote refs being pushed, after everything earlier in the command has happened. It scans exactly the commits that are about to leave, whatever command started the push.

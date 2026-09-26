@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""EXAMPLE — block a publish to a public destination when it would carry private data.
+"""EXAMPLE -- block a publish to a public destination when it would carry private data.
 
-Fictional example for the reference tree. Adapt the trigger patterns and the
-term file to your client and your own private terms; do not run it unreviewed.
+Fictional example for the reference tree. Adapt the term file and the tool
+names to your client; do not run it unreviewed. CI runs its probe suite:
+tests/pre-publish-scan-probes.py.example.
 
 This is the FIRST of two layers. It runs before the agent's shell command, so
 it sees a command string, not the push itself. A git `pre-push` hook is the
@@ -11,51 +12,62 @@ earlier in the command has happened. Use both. See "Known limits" below.
 
 Design notes worth keeping if you rewrite this:
 
-  * It scans what the push can publish, not just what is on disk: every
-    tracked and untracked file in the working tree, file names as well as
-    contents, the staged index, and the added lines of every commit on a local
-    branch or tag that no remote has yet (binary content included). A leak
-    committed and then deleted in a later commit is still in the push. Making
-    a repository public exposes its whole history, so a visibility change
-    scans every commit. Ignored files are skipped only when the command does
-    not force-add ("git add -f" can publish an ignored file).
+  * It parses the command, it does not grep it. Commands are split into simple
+    commands with quotes respected, following cd / pushd / popd, subshells,
+    if/then and loops, `$(...)` even inside quotes, `bash -c` / `eval`
+    strings, heredocs fed to a shell, `git -C`, xargs/find wrappers, and git
+    aliases (expanded, so an alias's own remote counts). A heredoc that is only
+    data -- a note, a commit message -- is not read as commands, and neither is
+    `git commit -m "... push ..."`. A word-matching gate blocks both of those,
+    and a gate that blocks ordinary work gets switched off.
+
+  * It checks where each publish really goes: every push URL of the named
+    remote, or for a bare push the branch's push remote; `--repo` for gh
+    commands; a `gh api` endpoint's repository. An unresolved destination is
+    public. `--dry-run` publishes nothing.
+
+  * It scans what the publish can carry, not just what is on disk: file names
+    and contents in the working tree (tracked and untracked; ignored files too
+    when the command force-adds), symlink targets as text, the staged index,
+    and every commit the target remote does not have -- diffs, commit messages,
+    branch and tag names, tag messages, and Git LFS objects. Remote-tracking
+    refs only narrow that range when the push URL is also the fetch URL.
+    Making a repository public, or creating one from a source directory, scans
+    all history; creating one from a non-public template is blocked. Gist
+    files, release assets, and issue, PR, release and API text are scanned
+    directly.
 
   * It has no exclude list, deliberately. An exclusion added to quieten noise
     is where unreviewed content collects.
 
-  * It FAILS CLOSED. An unresolved destination is treated as public. A
-    malformed or incomplete payload, an unresolvable repository, a file list or
-    history that cannot be produced, and a file that cannot be read or is over
-    the size cap all block: an unscanned tree is not a clean tree. Publishing
-    commands whose content it cannot see (a public gist or release with file
-    arguments, a visibility change on another repository) are blocked with a
-    request to run them by hand after review.
+  * It FAILS CLOSED once a publish is involved. An unreadable or oversized
+    file, an unresolvable repository or directory, a crash, a scan past its
+    time budget, commands nested too deeply to follow, and content it cannot
+    see (a body read from stdin, another repository's visibility change) all
+    block. A crash is caught explicitly: most clients treat any exit code other
+    than the blocking one as "carry on". A command that is not a publish is
+    never blocked.
 
-  * It checks every publishing operation in the command, and the destination
-    each one will actually use: the push URL (which can differ from the fetch
-    URL) of the named remote or, for a bare push, the branch's push remote,
-    after applying any "cd dir &&" or "git -C dir".
-
-  * Its report names the file, line, and rule number only, and hides a file
-    name that itself matches a rule. Printing the matched text or the pattern
-    would copy the protected value into logs and the conversation.
-
-  * It has a probe suite: tests/pre-publish-scan-probes.py.example, with quiet
-    cases, the inputs it exists to catch, and mutations that must each turn a
-    case red.
+  * Its report names the file, line, and term-file line number only, and hides
+    a file name that itself matches. Printing the matched text copies the
+    protected value into logs and the conversation.
 
   * The term file lives OUTSIDE any published tree. A denylist committed to a
     public repository publishes the strings it exists to suppress. For
-    generated output prefer an allowlist instead: assert every string present
-    is one you intended to publish.
+    generated output prefer an allowlist: assert every string present is one
+    you intended to publish.
 
 Known limits (why the pre-push layer exists):
 
-  * Content created by an earlier step of the same command ("write a file &&
-    git add && git commit && git push") does not exist yet when this runs.
-  * It parses shell with regular expressions; an unusual wrapper (a script, an
-    alias, eval) can hide a push from it.
+  * Content created by an earlier step of the same command does not exist yet.
+  * Shell is parsed, not run: a script file, a shell function, or a command
+    built from variables can hide a push. A directory built from a variable
+    blocks; a script that pushes is not seen.
   * Compressed formats (archives, most images) can hide text from a byte scan.
+  * It scans every local branch and all untracked files, not only what this
+    push sends. That is deliberate -- a script earlier in the command can
+    commit anything -- so a private draft sitting in a public repository blocks
+    until it is moved out or ignored.
 
 Hook payload arrives on stdin as JSON. Clients do not pass tool input via
 environment variables.
@@ -64,34 +76,324 @@ environment variables.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 TERMS_FILE = Path(__file__).parent / "private-terms.txt.example"
-MAX_FILE_BYTES = 2_000_000
+MAX_FILE_BYTES = 20_000_000
+# Claude Code's PreToolUse default timeout is 600s and a timed-out gate now
+# blocks, but it blocks with no reason. Our own budget says why.
+try:  # the env override can only shorten the budget (probes use it)
+    BUDGET = min(90.0, float(os.environ.get("PUBLISH_GATE_BUDGET", "90")))
+except ValueError:
+    BUDGET = 90.0
+DEADLINE = time.monotonic() + BUDGET
 
-GIT_PUSH = re.compile(r"\bgit\b[^;&|\n]*?\spush\b([^;&|\n]*)")  # options may sit between
-REPO_CREATE = re.compile(r"\bgh\s+repo\s+create\b")
-GIST_CREATE = re.compile(r"\bgh\s+gist\s+create\b")
-RELEASE_CREATE = re.compile(r"\bgh\s+release\s+create\b")
-MAKE_PUBLIC = re.compile(r"\bgh\s+repo\s+edit\b.*--visibility\s+public")
-PUBLISH_PATTERNS = (GIT_PUSH, REPO_CREATE, GIST_CREATE, RELEASE_CREATE, MAKE_PUBLIC)
-CD_STEP = re.compile(r"(?:^|[;&|(]\s*)(?:cd|pushd)\s+([^\s;&|)]+)")
-FORCE_ADD = re.compile(r"\bgit\b[^;&|\n]*?\sadd\b[^;&|\n]*\s(?:-f|--force)\b")
-REPO_FLAG = re.compile(r"(?:\s-R|--repo)[=\s]+(\S+)")
+# Every tool that runs a shell command. A client with a second one (a background
+# runner, a monitor) must list it here, or it is an ungated shell.
+SHELL_TOOLS = ("Bash",)
+
+MAYBE_PUBLISH = re.compile(r"\b(?:git|gh)\b")
+SEPARATOR = re.compile(r"^[;&|()\n]+$")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+REDIRECT = re.compile(r"^\d*(?:>>?|<<?<?-?|>\|)")
+HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+SHELL_WORD = re.compile(r"(?:^|[\s|;&(/])(?:bash|sh|zsh|dash|ksh|fish|eval|\$\{?SHELL\}?)(?=\s|$)")
+REDIRECTING_CONFIG = re.compile(r"^(?:remote|url|branch|lfs)\.", re.IGNORECASE)
+REDIRECTING_ENV = re.compile(r"^GIT_(?:DIR|WORK_TREE|CONFIG\w*)=")
+DIFF_ARGS = ["--text", "--no-color", "-U0", "--src-prefix=@pgsrc@/", "--dst-prefix=@pgdst@/"]
+DIFF_HEADERS = ("+++ @pgdst@/", '+++ "@pgdst@/', "+++ /dev/null")
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
+MAX_DEPTH = 4
+WRAPPERS = {"env", "command", "builtin", "exec", "nohup", "sudo", "nice", "caffeinate", "time"}
+SHELLS = {"bash", "sh", "zsh", "dash"}
+FANOUT = {"xargs", "find", "parallel", "watch"}
+GIT_BUILTINS = set("""
+add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore
+check-ref-format checkout checkout-index cherry cherry-pick citool clean clone column commit
+commit-graph commit-tree config count-objects credential describe diff diff-files diff-index
+diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg
+for-each-ref for-each-repo format-patch fsck gc get-tar-commit-id grep gui hash-object help
+hook index-pack init instaweb interpret-trailers log ls-files ls-remote ls-tree mailinfo
+mailsplit maintenance merge merge-base merge-file merge-tree mktag mktree multi-pack-index mv
+name-rev notes pack-objects pack-refs patch-id prune prune-packed pull range-diff read-tree
+rebase reflog remote repack replace request-pull rerere reset restore rev-list rev-parse revert
+rm send-email shortlog show show-branch show-ref sparse-checkout stash status stripspace
+submodule switch symbolic-ref tag unpack-file unpack-objects update-index update-ref
+update-server-info var verify-commit verify-pack verify-tag version whatchanged worktree
+write-tree lfs
+""".split())
+GITHUB_REPO = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE)
 
 
-def load_terms() -> list[re.Pattern]:
+# ---------------------------------------------------------------- parsing
+
+class Parsed:
+    def __init__(self):
+        self.ops = []            # (kind, dirs, args)
+        self.force_add = False
+        self.redirected = False  # git --git-dir / --work-tree
+        self.pushd = []
+
+
+def strip_heredocs(command):
+    """Drop heredoc bodies that are data (a note, a commit message) so prose mentioning a
+    push is not read as one -- a note written this way was falsely blocked. A body fed
+    to a shell (`bash <<EOF`, `cat <<EOF | sh`) is a script and stays. Unterminated: keep all."""
+    out, pos = [], 0
+    for m in HEREDOC.finditer(command):
+        if m.start() < pos:
+            continue
+        line_start = command.rfind("\n", 0, m.start()) + 1
+        line_end = command.find("\n", m.end())
+        if line_end == -1:
+            break
+        indent = r"[ \t]*" if m.group(1) else ""
+        end = re.compile(rf"^{indent}{re.escape(m.group(3))}[ \t]*$", re.M).search(
+            command, line_end + 1)
+        if not end:
+            break
+        out.append(command[pos:line_end + 1])
+        if SHELL_WORD.search(command[line_start:line_end]):
+            out.append(command[line_end + 1:end.end()])
+        pos = end.end()
+    out.append(command[pos:])
+    return "".join(out)
+
+
+def tokenize(command):
+    command = strip_heredocs(command)
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+        lex.whitespace = " \t\r"
+        lex.whitespace_split = True
+        lex.commenters = ""
+        return list(lex)
+    except ValueError:  # unbalanced quote (often heredoc prose): split crudely
+        return re.findall(r"[;&|()\n]+|[^\s;&|()]+", command)
+
+
+def change_dir(dirs, target):
+    """A cd target may not exist yet, or may fail; keep the old dir as a candidate."""
+    if dirs is None or target == "-" or re.search(r"[$`*?]", target):
+        return None
     out = []
-    for line in TERMS_FILE.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            out.append(re.compile(line, re.IGNORECASE))
+    for d in dirs:
+        new = os.path.normpath(os.path.join(d, os.path.expanduser(target)))
+        out.append(new)
+        if not os.path.isdir(new):
+            out.append(d)
+    return tuple(dict.fromkeys(out))[:4]
+
+
+def strip_redirects(cmd):
+    out, skip = [], False
+    for tok in cmd:
+        if skip:
+            skip = False
+            continue
+        m = REDIRECT.match(tok)
+        if m and not re.search(r"\s", tok):
+            skip = m.end() == len(tok)
+            continue
+        out.append(tok)
     return out
 
 
-def run(args: list[str], cwd: str) -> str | None:
+def substitutions(token):
+    """The scripts inside $(...) and `...` in one token. A quoted substitution stays a single
+    token after tokenizing, but the shell still runs it."""
+    out, i = [], 0
+    while i < len(token):
+        if token.startswith("$(", i):
+            depth, j, quote = 1, i + 2, None
+            while j < len(token) and depth:
+                ch = token[j]
+                if quote:
+                    quote = None if ch == quote else quote
+                elif ch in "'\"":
+                    quote = ch
+                else:
+                    depth += {"(": 1, ")": -1}.get(ch, 0)
+                j += 1
+            out.append(token[i + 2:j - 1])
+            i = j
+        elif token[i] == "`":
+            j = token.find("`", i + 1)
+            if j == -1:
+                break
+            out.append(token[i + 1:j])
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def walk(tokens, dirs, parsed, depth=0):
+    stack, cmd = [], []
+    for tok in tokens + [";"]:
+        if SEPARATOR.match(tok):
+            if cmd:
+                dirs = simple_command(cmd, dirs, parsed, depth)
+                cmd = []
+            for ch in tok:
+                if ch == "(":
+                    stack.append(dirs)
+                elif ch == ")" and stack:
+                    dirs = stack.pop()
+            continue
+        for script in substitutions(tok):
+            nested(script, dirs, parsed, depth)
+        cmd.append(tok)
+    return dirs
+
+
+def nested(script, dirs, parsed, depth):
+    """Parse a script the shell will run: a substitution, a -c string, eval, an alias. Past
+    the depth limit, block instead of silently stopping."""
+    if depth >= MAX_DEPTH:
+        if MAYBE_PUBLISH.search(script):
+            parsed.ops.append(("unseen", dirs, ["commands nested too deeply to check"]))
+        return
+    walk(tokenize(script), dirs, parsed, depth + 1)
+
+
+def simple_command(cmd, dirs, parsed, depth):
+    cmd = strip_redirects(cmd)
+    i = 0
+    while i < len(cmd):
+        if ASSIGNMENT.match(cmd[i]) or cmd[i] in KEYWORDS:
+            if REDIRECTING_ENV.match(cmd[i]):
+                parsed.redirected = True
+            i += 1
+        elif cmd[i] in WRAPPERS:
+            i += 1
+            while i < len(cmd) and cmd[i].startswith("-"):
+                i += 1
+        elif cmd[i] == "timeout":
+            i += 1
+            while i < len(cmd) and cmd[i].startswith("-"):
+                i += 1
+            i += 1  # the duration
+        else:
+            break
+    cmd = cmd[i:]
+    if not cmd:
+        return dirs
+    word, args = os.path.basename(cmd[0]), cmd[1:]
+
+    if word in ("cd", "pushd"):
+        targets = [a for a in args if a == "-" or not a.startswith("-")]
+        if word == "pushd":
+            parsed.pushd.append(dirs)
+        return change_dir(dirs, targets[0] if targets else "~")
+    if word == "popd":
+        return parsed.pushd.pop() if parsed.pushd else None
+    if word == "eval":
+        nested(" ".join(args), dirs, parsed, depth)
+    elif word in SHELLS:
+        for j, a in enumerate(args):
+            if re.match(r"^-[a-z]*c[a-z]*$", a) and j + 1 < len(args):
+                nested(args[j + 1], dirs, parsed, depth)
+                break
+    elif word == "git":
+        git_command(args, dirs, parsed, depth)
+    elif word == "gh":
+        gh_command(args, dirs, parsed)
+    elif word in FANOUT and "git" in args:
+        git_command(args[args.index("git") + 1:], dirs, parsed, depth)
+    return dirs
+
+
+def git_command(args, dirs, parsed, depth):
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        a = args[i]
+        if a == "-C":
+            dirs = change_dir(dirs, args[i + 1]) if i + 1 < len(args) else None
+            i += 2
+        elif a in ("-c", "--config-env"):
+            if i + 1 < len(args) and REDIRECTING_CONFIG.match(args[i + 1]):
+                parsed.redirected = True  # e.g. -c remote.origin.url=...: a destination we
+            i += 2                        # cannot see through `git remote`
+        elif a == "--namespace":
+            i += 2
+        elif a.split("=")[0] in ("--git-dir", "--work-tree"):
+            parsed.redirected = True
+            i += 1 if "=" in a else 2
+        else:
+            i += 1
+    if i >= len(args):
+        return
+    sub, rest = args[i], args[i + 1:]
+    if sub == "push":
+        if not any(r == "--dry-run" or re.match(r"^-[a-zA-Z]*n[a-zA-Z]*$", r) for r in rest):
+            parsed.ops.append(("push", dirs, rest))
+    elif sub == "add":
+        if any(r == "--force" or re.match(r"^-[a-zA-Z]*f", r) for r in rest):
+            parsed.force_add = True
+    elif sub == "submodule" and "push" in rest:
+        parsed.ops.append(("unseen", dirs, ["a push inside `git submodule foreach`"]))
+    elif sub not in GIT_BUILTINS and dirs:
+        # Expand the alias itself: `!git push public main` carries its own destination.
+        for d in existing(dirs):
+            alias = run(["git", "config", "--get", f"alias.{sub}"], d)
+            if alias:
+                script = alias[1:] if alias.startswith("!") else "git " + alias
+                nested(script + " " + shlex.join(rest), (d,), parsed, depth)
+
+
+def gh_command(args, dirs, parsed):
+    group, action = (args + ["", ""])[:2]
+    rest = args[2:]
+    if group == "repo" and action == "create":
+        parsed.ops.append(("repo-create", dirs, rest))
+    elif group == "repo" and action == "edit":
+        if "public" in flag_values(rest, "--visibility"):
+            parsed.ops.append(("make-public", dirs, rest))
+    elif group == "gist" and action == "create":
+        parsed.ops.append(("gist", dirs, rest))
+    elif group == "release" and action in ("create", "upload", "edit"):
+        parsed.ops.append(("release-" + action, dirs, rest))
+    elif group in ("issue", "pr") and action in ("create", "comment", "edit", "review"):
+        parsed.ops.append(("text", dirs, rest))
+        if group == "pr" and action == "create" and not flag_values(rest, "--head", "-H"):
+            parsed.ops.append(("push", dirs, []))  # gh may push the branch first
+    elif group == "api":
+        parsed.ops.append(("api", dirs, args[1:]))
+
+
+# ------------------------------------------------------------ arguments
+
+def flag_values(args, *names):
+    out = []
+    for j, a in enumerate(args):
+        for name in names:
+            if a == name and j + 1 < len(args):
+                out.append(args[j + 1])
+            elif name.startswith("--") and a.startswith(name + "="):
+                out.append(a[len(name) + 1:])
+    return out
+
+
+def positionals(args, value_flags):
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a.startswith("-") and a != "-":
+            skip = a in value_flags
+        else:
+            out.append(a)
+    return out
+
+
+# ---------------------------------------------------------- destinations
+
+def run(args, cwd):
     try:
         r = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
                            errors="replace", timeout=20)
@@ -100,191 +402,390 @@ def run(args: list[str], cwd: str) -> str | None:
         return None
 
 
-def unquote(token: str) -> str:
-    return os.path.expanduser(token.strip("'\""))
+def repo_slug(target):
+    m = GITHUB_REPO.search(target)
+    return f"{m.group(1)}/{m.group(2)}" if m else target
 
 
-def repository_dir(command: str, first_publish: re.Match, cwd: str) -> str:
-    for step in CD_STEP.finditer(command[:first_publish.start()]):
-        cwd = os.path.join(cwd, unquote(step.group(1)))
-    other_dir = re.search(r"\bgit\s+-C\s+(\S+)", first_publish.group(0))
-    if other_dir:
-        cwd = os.path.join(cwd, unquote(other_dir.group(1)))
-    source = re.search(r"--source[=\s]+(\S+)", command[first_publish.start():])
-    if REPO_CREATE.match(command, first_publish.start()) and source:
-        cwd = os.path.join(cwd, unquote(source.group(1)))
-    return os.path.normpath(cwd)
+_visibility = {}
 
 
-def visibility_is_public(target: list[str], cwd: str) -> bool:
-    visibility = run(["gh", "repo", "view", *target, "--json", "visibility",
-                      "--jq", ".visibility"], cwd)
-    if visibility is None:
-        return True  # unresolved -> assume public
-    return visibility.upper() == "PUBLIC"
+def visibility(target, cwd):
+    """PUBLIC / PRIVATE / INTERNAL, or None when unresolved. target: an owner/repo, a URL, or
+    None for the repository in cwd."""
+    key = (repo_slug(target), None) if target else (None, cwd)
+    if key not in _visibility:
+        extra = [repo_slug(target)] if target else []
+        vis = run(["gh", "repo", "view", *extra, "--json", "visibility",
+                   "--jq", ".visibility"], cwd)
+        _visibility[key] = vis.upper() if vis else None
+    return _visibility[key]
 
 
-def default_push_remote(cwd: str) -> str:
+def is_public(target, cwd):
+    return visibility(target, cwd) in (None, "PUBLIC")  # unresolved -> public
+
+
+def push_remote(cwd):
     branch = run(["git", "symbolic-ref", "--short", "-q", "HEAD"], cwd)
-    for key in ([f"branch.{branch}.pushRemote"] if branch else []) + ["remote.pushDefault"] \
-            + ([f"branch.{branch}.remote"] if branch else []):
+    keys = ([f"branch.{branch}.pushRemote"] if branch else []) + ["remote.pushDefault"] \
+        + ([f"branch.{branch}.remote"] if branch else [])
+    for key in keys:
         value = run(["git", "config", "--get", key], cwd)
         if value:
             return value
     return "origin"
 
 
-def push_is_public(push: re.Match, cwd: str) -> bool:
-    positional = [t for t in push.group(1).split() if not t.startswith("-")]
-    remote = positional[0] if positional else default_push_remote(cwd)
-    if ":" in remote or "/" in remote:
-        url = remote  # pushing straight to a URL
+def outgoing_range(root, remote, refspecs=()):
+    """The `git log` range a push to `remote` can publish, or None when every push URL is
+    private. An unknown remote has no URL and counts as public."""
+    is_url = ":" in remote or "/" in remote
+    if is_url:
+        urls = [remote]
     else:
-        url = run(["git", "remote", "get-url", "--push", remote], cwd)
-    if url is None:
-        return True  # unknown remote -> assume public
-    return visibility_is_public([url], cwd)
+        out = run(["git", "remote", "get-url", "--push", "--all", remote], root)
+        urls = out.splitlines() if out else []
+        configured = run(["git", "config", "--get-all", f"remote.{remote}.push"], root)
+        refspecs = list(refspecs) + (configured.splitlines() if configured else [])
+        if run(["git", "config", "--get", "--bool", f"remote.{remote}.mirror"], root) == "true":
+            refspecs.append("--mirror")
+    if urls and not any(is_public(url, root) for url in urls):
+        return None
+    sources = [r.lstrip("+").split(":")[0] for r in refspecs]
+    if "--mirror" in refspecs or any("*" in s or re.match(r"refs/(?!heads/|tags/)", s)
+                                     for s in sources):
+        refs = ["--all"]
+    else:  # HEAD: a detached HEAD pushed by name; any other source a refspec names
+        refs = ["--branches", "--tags", "HEAD"] + [
+            s for s in sources if s and s != "HEAD"
+            and run(["git", "rev-parse", "--verify", "-q", s + "^{commit}"], root)]
+    # Tracking refs describe the FETCH repo. Only when every push URL is also a fetch URL do
+    # they say what the push target already has.
+    fetch = None if is_url else run(["git", "remote", "get-url", "--all", remote], root)
+    if urls and fetch and set(urls) <= set(fetch.splitlines()):
+        return refs + ["--not", f"--remotes={remote}"]
+    return refs
 
 
-def destination_is_public(command: str, cwd: str) -> bool:
-    if "--public" in command or MAKE_PUBLIC.search(command):
-        return True
-    if any(push_is_public(push, cwd) for push in GIT_PUSH.finditer(command)):
-        return True
-    if RELEASE_CREATE.search(command):
-        repo_flag = REPO_FLAG.search(command)
-        return visibility_is_public([repo_flag.group(1)] if repo_flag else [], cwd)
-    return False  # a repo or gist created without --public is private or secret
+def read_text(path):
+    try:
+        return Path(path).read_bytes()[:MAX_FILE_BYTES].decode("utf-8", "replace")
+    except OSError:
+        return ""  # an unreadable body file is reported by the scan that follows
 
 
-def unseen_content(command: str) -> str | None:
-    """A publishing command whose content this hook cannot scan."""
-    if MAKE_PUBLIC.search(command) and REPO_FLAG.search(command):
-        return "a visibility change on a repository named by --repo"
-    if GIST_CREATE.search(command) or RELEASE_CREATE.search(command):
-        return "a gist or release publishes files this hook does not scan"
-    return None
+def existing(dirs):
+    return [d for d in dirs if os.path.isdir(d)]
 
 
-def block(reason: str) -> int:
-    print(f"BLOCKED: {reason}\nThe gate could not evaluate its condition, so it "
-          "treats the publish as unsafe. Fix the cause and retry.", file=sys.stderr)
+# --------------------------------------------------------------- scanning
+
+class Scan:
+    def __init__(self, terms):
+        self.terms = terms
+        self.hits = []          # (source, line, rule)
+        self.unscannable = []
+        self.unseen = []
+        self.done = set()
+
+    def rule(self, text):
+        for number, pat in self.terms:
+            if pat.search(text):
+                return number
+        return None
+
+    def lines(self, source, text, added_only=False):
+        for n, line in enumerate(text.splitlines(), 1):
+            if time.monotonic() > DEADLINE:
+                raise TimeoutError
+            if added_only and (not line.startswith("+") or line.startswith(DIFF_HEADERS)):
+                continue
+            number = self.rule(line)
+            if number:
+                self.hits.append((source, n, number))
+
+    def shown(self, name):
+        return "(a file name)" if self.rule(name) else name
+
+    def file(self, path, label, in_repo=False):
+        if self.rule(label):
+            self.hits.append(("(a file name)", 0, self.rule(label)))
+        if in_repo and os.path.islink(path):
+            self.lines(label, os.readlink(path))  # git publishes the link text, not the target
+            return
+        if in_repo and (os.path.isdir(path) or not os.path.lexists(path)):
+            return  # a submodule (its own repo), or a tracked file deleted / outside a sparse
+            #         checkout -- its committed content is covered by the history scan
+        try:
+            if os.path.getsize(path) > MAX_FILE_BYTES:
+                self.unscannable.append(label)
+                return
+            data = Path(path).read_bytes()
+        except OSError:
+            self.unscannable.append(label)
+            return
+        self.lines(label, data.decode("utf-8", "replace"))
+        if not data.isascii():  # a legacy-encoded file: its non-ASCII terms only match here
+            self.lines(label, data.decode("latin-1"))
+
+    def repo(self, root, include_ignored, history):
+        key = (root, include_ignored, tuple(history))
+        if key in self.done:
+            return
+        self.done.add(key)
+        listing_args = ["git", "ls-files", "-z", "--cached", "--others"]
+        if not include_ignored:
+            listing_args.append("--exclude-standard")
+        listing = run(listing_args, root)
+        staged = run(["git", "diff", "--cached", *DIFF_ARGS], root)
+        ref_scope = [] if "--all" in history else ["refs/heads", "refs/tags"]
+        refs = run(["git", "for-each-ref", "--format=%(refname:short)%0a%(contents)",
+                    *ref_scope], root)
+        git_dir = run(["git", "rev-parse", "--git-common-dir"], root)
+        log = messages = ""
+        if run(["git", "rev-parse", "--verify", "-q", "HEAD"], root) is not None:
+            log = run(["git", "log", "-p", *DIFF_ARGS, "--format=",
+                       *history], root)
+            messages = run(["git", "log", "--format=%B", *history], root)
+        if None in (listing, staged, refs, git_dir, log, messages):
+            self.unseen.append("could not list the files and commits that would ship")
+            return
+        for rel in sorted(set(filter(None, listing.split("\0")))):
+            self.file(os.path.join(root, rel), rel, in_repo=True)
+        self.lines("(staged changes)", staged, added_only=True)
+        self.lines("(unpushed commits)", log, added_only=True)
+        self.lines("(commit messages)", messages)
+        self.lines("(branch and tag names, tag messages)", refs)
+        storage = run(["git", "config", "--get", "lfs.storage"], root)
+        lfs = Path(root, git_dir, os.path.expanduser(storage or "lfs"), "objects")
+        # ^ uploaded by LFS's own pre-push step; lfs.storage may move it (relative = git dir)
+        for obj in sorted(p for p in lfs.rglob("*") if p.is_file()) if lfs.is_dir() else []:
+            self.file(str(obj), "(a Git LFS object)")
+
+
+def evaluate(parsed, scan):
+    if parsed.redirected and any(k == "push" for k, _, _ in parsed.ops):
+        scan.unseen.append("a push whose repository or remote is set by --git-dir, --work-tree, "
+                           "GIT_DIR / GIT_CONFIG*, or -c remote./url./branch./lfs.")
+    for kind, dirs, args in parsed.ops:
+        if kind == "unseen":
+            scan.unseen.append(args[0])
+            continue
+        if dirs is None:
+            scan.unseen.append("could not resolve which directory the publish runs in "
+                               "(a variable, `cd -`, or popd)")
+            continue
+        for d in existing(dirs):
+            evaluate_one(kind, d, args, parsed, scan)
+
+
+def evaluate_one(kind, d, args, parsed, scan):
+    root = run(["git", "rev-parse", "--show-toplevel"], d)
+    if kind == "push":
+        if root is None:
+            return  # git itself refuses to push outside a repository
+        value_flags = {"--repo", "-o", "--push-option", "--receive-pack", "--exec"}
+        named = flag_values(args, "--repo") + positionals(args, value_flags)
+        if not named and run(["git", "remote"], root) == "" \
+                and push_remote(root) == "origin":
+            return  # no remote and no configured destination: git refuses the push
+        remote = named[0] if named else push_remote(root)
+        refspecs = positionals(args, value_flags)[1:] + (["--mirror"] if "--mirror" in args
+                                                          else [])
+        outgoing = outgoing_range(root, remote, refspecs)
+        if outgoing is not None:
+            scan.repo(root, parsed.force_add, outgoing)
+
+    elif kind == "repo-create":
+        if "--public" not in args:
+            return
+        value_flags = {"--source", "-s", "--description", "-d", "--homepage", "-h", "--team",
+                       "-t", "--template", "-p", "--remote", "-r", "--gitignore", "-g",
+                       "--license", "-l"}
+        for text in positionals(args, value_flags) + flag_values(args, "--description", "-d"):
+            scan.lines("(the repository name or description)", text)
+        for template in flag_values(args, "--template", "-p"):
+            if visibility(template, d) != "PUBLIC":  # its files become this repo's files
+                scan.unseen.append("a public repository created from a template that is "
+                                   "not public")
+        for source in flag_values(args, "--source", "-s"):
+            src_root = run(["git", "rev-parse", "--show-toplevel"], os.path.join(d, source))
+            if src_root is None:
+                scan.unseen.append("could not resolve the --source repository")
+            else:
+                scan.repo(src_root, parsed.force_add, ["--all"])
+
+    elif kind == "make-public":
+        named = flag_values(args, "--repo", "-R") + positionals(
+            args, {"--visibility", "--repo", "-R", "--description", "-d", "--homepage", "-h",
+                   "--default-branch", "--add-topic", "--remove-topic"})
+        local = run(["gh", "repo", "view", "--json", "nameWithOwner",
+                     "--jq", ".nameWithOwner"], d) if root else None
+        if named and (local is None or repo_slug(named[0]).lower() != local.lower()):
+            scan.unseen.append("a visibility change on a repository other than this one")
+        elif root is None:
+            scan.unseen.append("could not resolve the repository being made public")
+        else:
+            scan.repo(root, parsed.force_add, ["--all"])
+
+    elif kind == "gist":
+        if not ({"--public", "-p"} & set(args)):
+            return
+        for text in flag_values(args, "--desc", "-d"):
+            scan.lines("(the gist description)", text)
+        files = positionals(args, {"--desc", "-d", "--filename", "-f"})
+        if not files or "-" in files:
+            scan.unseen.append("a public gist read from stdin")
+        for f in files:
+            if f != "-":
+                scan.file(os.path.join(d, os.path.expanduser(f)), f)
+
+    elif kind.startswith("release-"):
+        repo = (flag_values(args, "--repo", "-R") or [None])[0]
+        if not is_public(repo, d):
+            return
+        value_flags = {"--notes", "-n", "--title", "-t", "--notes-file", "-F", "--target",
+                       "--discussion-category", "--repo", "-R", "--notes-start-tag", "--tag"}
+        for text in flag_values(args, "--notes", "-n", "--title", "-t"):
+            scan.lines("(the release notes or title)", text)
+        for f in flag_values(args, "--notes-file", "-F"):
+            if f == "-":
+                scan.unseen.append("release notes read from stdin")
+            else:
+                scan.file(os.path.join(d, os.path.expanduser(f)), f)
+        if kind != "release-edit":
+            for asset in positionals(args, value_flags)[1:]:
+                path, _, label = asset.partition("#")
+                scan.lines("(an asset label)", label)
+                scan.file(os.path.join(d, os.path.expanduser(path)), path)
+        if kind == "release-create" and root and repo is None:
+            outgoing = outgoing_range(root, push_remote(root))
+            if outgoing is not None:
+                scan.repo(root, parsed.force_add, outgoing)
+
+    elif kind == "text":
+        repo = (flag_values(args, "--repo", "-R") or [None])[0]
+        if not is_public(repo, d):
+            return
+        for text in flag_values(args, "--body", "-b", "--title", "-t"):
+            scan.lines("(the issue or PR text)", text)
+        for f in flag_values(args, "--body-file", "-F"):
+            if f == "-":
+                scan.unseen.append("an issue or PR body read from stdin")
+            else:
+                scan.file(os.path.join(d, os.path.expanduser(f)), f)
+
+    elif kind == "api":
+        fields = flag_values(args, "-f", "--raw-field", "-F", "--field")
+        inputs = flag_values(args, "--input")
+        body_files = inputs + [f.partition("=")[2][1:] for f in fields
+                               if f.partition("=")[2].startswith("@")]
+        joined = " ".join(args) + "".join("\n" + read_text(os.path.join(d, os.path.expanduser(f)))
+                                          for f in body_files if f != "-")
+        if re.search(r"private\"?\s*[=:]\s*false|visibility\"?\s*[=:]\s*\"?public", joined, re.I):
+            scan.unseen.append("a visibility change through `gh api`")
+            return
+        if "-" in body_files:
+            scan.unseen.append("an API body read from stdin")
+            return
+        method = (flag_values(args, "--method", "-X") or [""])[0].upper()
+        if method == "GET" or not (fields or inputs):
+            return
+        endpoint = (positionals(args, {"-X", "--method", "-f", "--raw-field", "-F", "--field",
+                                       "--input", "-H", "--header", "-q", "--jq", "-t",
+                                       "--template", "--hostname", "--cache"}) or [""])[0]
+        if endpoint == "graphql" and not re.search(r"\bmutation\b", joined):
+            return  # a GraphQL read
+        target = re.match(r"^/?repos/([^/]+)/([^/?]+)", endpoint)
+        if target and not is_public(None if "{" in target.group(0)
+                                    else f"{target.group(1)}/{target.group(2)}", d):
+            return  # a write to a private repository
+        # Any other endpoint (gists, users, orgs, graphql mutations): destination unknown.
+        for field in fields:
+            value = field.partition("=")[2]
+            if value.startswith("@"):
+                scan.file(os.path.join(d, os.path.expanduser(value[1:])), value[1:])
+            else:
+                scan.lines("(an API field)", value)
+        for f in inputs:
+            scan.file(os.path.join(d, os.path.expanduser(f)), f)
+
+
+# ------------------------------------------------------------------- main
+
+def load_terms():
+    terms = []
+    for number, line in enumerate(TERMS_FILE.read_text().splitlines(), 1):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            terms.append((number, re.compile(line, re.IGNORECASE)))
+    return terms
+
+
+def block(reason):
+    print(f"BLOCKED: {reason}.\nThis gate cannot confirm the publish is free of private "
+          "data, so it refuses it. Review what would be published and run it yourself, or "
+          "fix the cause and retry.", file=sys.stderr)
     return 2
 
 
-def first_rule(text: str, patterns: list[re.Pattern]) -> int | None:
-    for number, pat in enumerate(patterns, 1):
-        if pat.search(text):
-            return number
-    return None
-
-
-def match_lines(source: str, text: str, patterns: list[re.Pattern],
-                hits: list[tuple], added_only: bool = False) -> None:
-    for n, line in enumerate(text.splitlines(), 1):
-        if added_only and not (line.startswith("+") and not line.startswith("+++")):
-            continue
-        number = first_rule(line, patterns)
-        if number:
-            hits.append((source, n, number))
-
-
-def scan(root: str, patterns: list[re.Pattern], include_ignored: bool,
-         whole_history: bool):
-    """Return (hits, unscannable), or None when what would ship cannot be listed."""
-    listing_args = ["git", "ls-files", "-z", "--cached", "--others"]
-    if not include_ignored:
-        listing_args.append("--exclude-standard")
-    listing = run(listing_args, root)
-    staged = run(["git", "diff", "--cached", "--text", "--no-color", "-U0"], root)
-    if listing is None or staged is None:
-        return None
-    history = ""
-    if run(["git", "rev-parse", "--verify", "-q", "HEAD"], root) is not None:
-        outgoing = ["--all"] if whole_history else ["--branches", "--tags", "--not", "--remotes"]
-        history = run(["git", "log", "-p", "--text", "--no-color", "-U0", "--format=",
-                       *outgoing], root)
-        if history is None:
-            return None
-
-    hits, unscannable = [], []
-    for rel in sorted(set(filter(None, listing.split("\0")))):
-        number = first_rule(rel, patterns)
-        if number:
-            hits.append(("(a file name)", 0, number))
-        path = Path(root) / rel
-        try:
-            if path.stat().st_size > MAX_FILE_BYTES:
-                unscannable.append(rel)
-                continue
-            data = path.read_bytes()
-        except OSError:
-            unscannable.append(rel)
-            continue
-        match_lines(rel, data.decode("latin-1"), patterns, hits)
-    match_lines("(staged changes)", staged, patterns, hits, added_only=True)
-    match_lines("(unpushed commits)", history, patterns, hits, added_only=True)
-    return hits, unscannable
-
-
-def shown(path: str, patterns: list[re.Pattern]) -> str:
-    return "(a file name)" if first_rule(path, patterns) else path
-
-
-def main() -> int:
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        return block("hook payload was not valid JSON")
-    if not isinstance(payload, dict) or not isinstance(payload.get("tool_name"), str):
-        return block("hook payload is not a tool event")
-    if payload["tool_name"] != "Bash":
+def gate(command, cwd):
+    parsed = Parsed()
+    walk(tokenize(command), (os.path.normpath(cwd),), parsed)
+    if not parsed.ops:
         return 0
-    tool_input = payload.get("tool_input")
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    if not isinstance(command, str):
-        return block("hook payload has no command string")
-    publishes = [m for p in PUBLISH_PATTERNS for m in [p.search(command)] if m]
-    if not publishes:
-        return 0
-
-    first = min(publishes, key=lambda m: m.start())
-    cwd = repository_dir(command, first, payload.get("cwd") or os.getcwd())
-    root = run(["git", "rev-parse", "--show-toplevel"], cwd)
-    if root is None:
-        return block("could not resolve the repository that would be published")
-    if not destination_is_public(command, cwd):
-        return 0
-    reason = unseen_content(command)
-    if reason:
-        return block(f"{reason}; review it and run it yourself")
-
     try:
         terms = load_terms()
     except (OSError, re.error) as exc:
-        return block(f"could not load the term file: {exc}")
+        return block(f"could not load the term file ({type(exc).__name__})")
     if not terms:
         return block("the term file is empty; an empty scan is not a clean scan")
-    result = scan(root, terms, include_ignored=bool(FORCE_ADD.search(command)),
-                  whole_history=bool(MAKE_PUBLIC.search(command)))
-    if result is None:
-        return block("could not list the files and commits that would ship")
-    hits, unscannable = result
-    if unscannable:
-        names = [shown(rel, terms) for rel in unscannable[:10]]
-        return block(f"{len(unscannable)} file(s) could not be scanned: " + ", ".join(names))
+    scan = Scan(terms)
+    evaluate(parsed, scan)
+    if scan.unseen:
+        return block("; ".join(dict.fromkeys(scan.unseen)))
+    if scan.unscannable:
+        names = [scan.shown(n) for n in scan.unscannable[:10]]
+        return block(f"{len(scan.unscannable)} file(s) could not be scanned (unreadable or "
+                     f"over {MAX_FILE_BYTES // 1_000_000}MB): " + ", ".join(names))
+    hits = list(dict.fromkeys(scan.hits))  # a non-ASCII file is read two ways
     if not hits:
         return 0
-
-    print(f"BLOCKED: public destination, and the push carries private data.\n"
-          f"{len(hits)} match(es) (file:line, rule number in the term file):\n",
-          file=sys.stderr)
+    out = [f"BLOCKED: publishing to a PUBLIC destination, and it would carry private data.",
+           f"{len(hits)} match(es) -- file:line (term file line number):", ""]
     for source, n, number in hits[:40]:
-        print(f"  {shown(source, terms)}:{n}  (rule {number})", file=sys.stderr)
-    print("\nDo not add an exclusion. Remove the content (and from any unpushed "
-          "commit), or move it out of the repository and ignore its path, then "
-          "retry.", file=sys.stderr)
+        out.append(f"  {scan.shown(source)}:{n}  (term file line {number})")
+    if len(hits) > 40:
+        out.append(f"  ... and {len(hits) - 40} more")
+    out += ["", "Do not add an exclusion. Remove the content (from any unpushed commit too), "
+                "or move it out of the repo and add its path to .gitignore, then retry."]
+    print("\n".join(out), file=sys.stderr)
     return 2
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = None
+    tool_input = payload.get("tool_input") if isinstance(payload, dict) else None
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    tool = payload.get("tool_name") if isinstance(payload, dict) else None
+    if isinstance(tool, str) and tool not in SHELL_TOOLS:
+        return 0
+    if not isinstance(tool, str) or not isinstance(command, str):
+        # Never block on our own confusion -- unless the text could be a publish.
+        return block("hook payload was malformed") if MAYBE_PUBLISH.search(raw) else 0
+    if not MAYBE_PUBLISH.search(command):
+        return 0
+    try:
+        return gate(command, payload.get("cwd") or os.getcwd())
+    except TimeoutError:
+        return block(f"the scan ran past its {BUDGET:g}-second budget")
+    except Exception as exc:  # exit 1 would let the command through
+        return block(f"the gate crashed ({type(exc).__name__})")
 
 
 if __name__ == "__main__":

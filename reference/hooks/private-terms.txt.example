@@ -38,9 +38,14 @@ first\.last@example\.com
 \bprivate-notes-root\b
 
 # --- credential shapes ---
+# Real keys contain hyphens (sk-ant-api03-..., sk-proj-...), so the second sk- rule allows
+# them. It needs its \b: without it, kebab-case names such as "task-verification-2026-..."
+# match ("sk-verification-..."), which is the kind of false alarm that gets a gate switched
+# off. Adding \b to the other rules would narrow rules that never misfired, so they stay.
 gh[pousr]_[A-Za-z0-9]{16,}
 github_pat_[A-Za-z0-9_]{20,}
-sk-[A-Za-z0-9_-]{20,}
+sk-[A-Za-z0-9]{20,}
+\bsk-[A-Za-z0-9_-]{20,}
 (AKIA|ASIA)[0-9A-Z]{16}
 xox[baprs]-[A-Za-z0-9-]{20,}
 AIza[0-9A-Za-z_-]{35}

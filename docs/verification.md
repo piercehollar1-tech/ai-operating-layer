@@ -62,6 +62,8 @@ For any claim that is external, current, niche, consequential, or load-bearing, 
 
 **A break-test proves nothing until the mutation is shown to change behaviour.** Confirm the harness runs the mutated copy (an absurd mutation must go red), that it drives the production path and not a "run as script" branch, and that a survivor is a real gap rather than an equivalent mutant. Retire a survivor only with the evidence written down.
 
+**Every mutation caught means the guards you wrote are tested, not that the guards you need exist.** The publication gate this repository's example is derived from passed its suite with all 64 mutations caught, and the next outside review still found a dozen new ways past it: a push inside `if … then`, an alias with its own remote, a second push URL, a commit message. Mutation testing measures the suite against the code; only adversarial review, and real input, measure the code against the world.
+
 **Testing a hook by hand forges its side effects.** A hook run manually really writes to its logs and state directories. Probe with the home directory redirected to a scratch location, never the live one, and keep one writer per event. Re-run the whole case list after each fix; one probe only clears the cause already found, and the first fix masks the second.
 
 A worked example of a suite with a `# covers:` line, a quiet case, and mutations that must each turn a case red is in [`reference/hooks/tests/`](../reference/hooks/tests/pre-publish-scan-probes.py.example); this repository's CI runs it.
