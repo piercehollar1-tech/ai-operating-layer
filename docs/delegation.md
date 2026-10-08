@@ -36,6 +36,8 @@ Subagents start cold. They do not see the conversation, the instruction files' n
 
 **A delegate-first gate** denies the first subagent dispatch of a session unless the delegation skill ran first. The identical retry passes. Measured before the gate existed: zero delegations across sixty-one sessions in which the option was documented and available. The gate turned a documented option into the door everything goes through.
 
+**Two exemptions, each matched by exact agent name.** The client's built-in read-only search agent skips both gates: it returns locations, not work, and a few hundred characters of brief cost more than the search it guards. Before the exemption, sixty-five sessions dispatched no subagent at all, cheap searches included. A fork of the current session skips only the delegate-first gate, because it already carries the conversation an outside lane would need written out; it still needs the brief and the report. A custom agent with a similar name is still gated.
+
 That second hook is the general pattern: **when a documented option is measured at zero use, wire it to the moment of action rather than rewriting the paragraph.**
 
 ## Orchestration: between "gate passed" and "result accepted"

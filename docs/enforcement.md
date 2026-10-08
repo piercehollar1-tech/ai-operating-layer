@@ -67,17 +67,17 @@ The blindness runs the other way too. **The model cannot observe a permission pr
 
 ## What a mature layer actually runs
 
-Roughly fifty hook registrations across the surface above, in one installation. The inventory, generalized, so the categories are visible without the names:
+Over forty hook registrations across the surface above, in one installation. The inventory, generalized, so the categories are visible without the names:
 
 | Moment | Blocking | Non-blocking |
 |---|---|---|
 | Session start | — | Project bootstrap · skill-index rebuild · consolidation-due and drain-due checks · audit sentinel · last-log recap · staged-summary flush |
 | Before a tool call | Credential guard · client-data gate on shared-store writes · destructive-command gate · intake gate on first-time installs · publication gate · deploy gate · schema-change gate · config-lint gate · review gate at commit and push · dispatch-contract gate · delegate-first gate · self-protect on the layer's own files | Symbol-search steer · route nudges |
-| After a tool call | — | Skill usage log · skill preflight injection · injection scan on every fetch · formatters · edit accumulator for the hooks directory |
-| After a tool failure | — | Known-failure router |
+| After a tool call | — | Skill usage log · skill preflight injection · injection scan on every fetch · edited-file accumulator for one batched format pass · redacted shell-command log · edit accumulator for the hooks directory |
+| After a tool failure | — | Tool-server health check |
 | On user input | — | Verbosity scoreboard · delegate nudge |
 | Before compaction | — | State preservation |
-| At stop | Citation gate · probe-suite runner on a red suite | Response-length measurement · detached summarizers |
+| At stop | Citation gate · probe-suite runner on a red suite | Response-length measurement · batched format and type check · desktop notification |
 | Session end | — | Detached backup · transcript summary · vault commit |
 
 **The layer guards itself.** An edit to the client settings, the adapter, or any hook file prompts. Without that, the cheapest way past every control is to edit the control.
@@ -123,7 +123,7 @@ external reference in generated output  -> blocked
 
 That fourth line is a real bug caught this way. `isinstance(True, int)` is `True` in Python, so a type check that looks correct accepts a boolean silently.
 
-Keep those cases beside the hook as a probe suite, declare which hooks each suite covers, and have a Stop hook run every suite after any edit under the hooks directory. The rules that keep that runner from becoming a trap, and the mutation discipline that proves a suite is checking rather than agreeing, are in [verification](verification.md).
+Keep those cases beside the hook as a probe suite, declare which hooks each suite covers, and have a Stop hook run the suites an edit under the hooks directory affects, and every suite when the edited file is one no suite declares. The rules that keep that runner from becoming a trap, and the mutation discipline that proves a suite is checking rather than agreeing, are in [verification](verification.md).
 
 ### A hook has two gates
 
@@ -155,15 +155,15 @@ The allowlist is strictly stronger, and the reason is not subtle: **a denylist o
 
 Both of these are stated as rules because both were discovered by a scan that reported clean while a leak sat inside the tree.
 
-**Scan what the push publishes, not just what is on disk.** A push carries every commit the remote does not have. A leak committed and then deleted in a later commit is gone from the working tree and still in the push; a staged copy can differ from the working copy. Scan the staged index and the added lines of every unpushed commit as well as the files — and the parts of a push that are not file contents: commit messages, branch and tag names, tag messages, symlink targets, Git LFS objects, and any ref a mirror push or a configured refspec sends. Remote-tracking refs describe the repository you fetch from; only trust them to say what the target already has when the push URL is also the fetch URL.
+**Scan what the push publishes, not just what is on disk.** A push carries every commit the remote does not have. A leak committed and then deleted in a later commit is gone from the working tree and still in the push; a staged copy can differ from the working copy. Scan the staged index and every object the push can send as well as the files — each blob whole, not the added lines of a patch, because a patch hides content added only by a merge commit, a line crafted to look like a diff header, and a tag that points straight at a blob — and the parts of a push that are not file contents: file names in every tree, commit messages, branch and tag names, tag messages, symlink targets, Git LFS objects, and any ref a mirror push or a configured refspec sends. Ask the remote itself what it already has (`git ls-remote`): remote-tracking refs describe the repository you fetch from, and they go stale when someone rewinds the remote elsewhere. Fall back to them only when the remote cannot be asked, and only when the push URL is also the fetch URL. A push with `--recurse-submodules=on-demand` publishes each changed submodule too, and text passed on the command line carries what the shell puts there: `--body "$(cat notes.md)"` publishes the file.
 
-**Check the destination the push will use.** A remote's push URL can differ from its fetch URL, a remote can have several push URLs, an alias can name its own remote, and a command can change directory (`cd dir && git push`, `git -C dir push`) before it pushes. Resolve the repository and every push URL from the command itself; anything that cannot be resolved is public.
+**Check the destination the push will use.** A remote's push URL can differ from its fetch URL, a remote can have several push URLs, an alias can name its own remote, and a command can change directory (`cd dir && git push`, `git -C dir push`) before it pushes. A `cd` that might not run — inside an `if` whose condition fails, a loop, a function, a pipeline, or after `||` — leaves the shell where it was, so scan every directory the shell might be in, not the one the `cd` names. A bare repository pushes without a working tree; scan its objects rather than treating it as no repository. Resolve the repository and every push URL from the command itself; anything that cannot be resolved is public.
 
-**Parse the command; do not grep it.** A gate that matches the words `git push` blocks `git commit -m "ready to push"`, a note written with a heredoc that mentions a push, and `git push 2>&1` read as a push to a remote named `2>` — while missing a push inside `if … then`, inside a quoted `$(...)`, or behind an alias. Split the command into the commands the shell will run: respect quotes, follow `cd` and subshells, read `bash -c` and `eval` strings and heredocs fed to a shell, expand aliases, and skip heredocs that are only data. Where the nesting goes deeper than the parser follows, block. A gate that blocks ordinary work gets switched off, which is a fail-open with extra steps.
+**Parse the command; do not grep it.** A gate that matches the words `git push` blocks `git commit -m "ready to push"`, a note written with a heredoc that mentions a push, and `git push 2>&1` read as a push to a remote named `2>` — while missing a push inside `if … then`, inside a quoted `$(...)`, or behind an alias. Split the command into the commands the shell will run: respect quotes, follow `cd` and subshells, read `bash -c` and `eval` strings and heredocs fed to a shell, expand aliases, and skip heredocs that are only data — except the `$(...)` and backticks in an unquoted one, which the shell runs before the data reaches its reader. Many programs run their arguments as a command (`arch`, `stdbuf`, `script`, zsh's `noglob`), and no list of them is ever complete, so treat any command whose arguments include `git`, `gh` or a shell as running it, unless it only prints or compares (`echo`, `grep`, `command -v`, `test`). Read each tool's options the way its own parser does: git takes any unique prefix of an option (`--mirr` is `--mirror`), a value in the next word even when it looks like an option (`git push -o --dry-run` really pushes), and the last of repeated options; gh bundles short flags (`-pw`), takes `--public=true`, and accepts a flag before the subcommand. Where the tool can list its own flags (gh's help does), read the list from the installed tool rather than keeping a copy, and expand the tool's own aliases and repository selectors (`gh alias`, `GH_REPO`) as it would. Where the nesting goes deeper than the parser follows, block. A gate that blocks ordinary work gets switched off, which is a fail-open with extra steps.
 
 **Never echo the match.** A report that prints the matched line, or the pattern that matched, copies the protected value into logs and the conversation. Report the file, the line, and a rule number.
 
-Four rounds of outside review found these gaps, and dozens more, in earlier versions of the example hook in [`reference/hooks/`](../reference/hooks/pre-publish-scan.py.example), each after the hook's own probe suite had passed. Each is now a probe with a matching mutation.
+Thirteen rounds of outside review found these gaps, and dozens more, in earlier versions of the example hook in [`reference/hooks/`](../reference/hooks/pre-publish-scan.py.example), each after the hook's own probe suite had passed. Each is now a probe with a matching mutation.
 
 ### Two layers, because a command string is not a push
 

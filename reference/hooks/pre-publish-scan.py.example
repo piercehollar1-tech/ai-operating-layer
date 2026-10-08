@@ -15,27 +15,88 @@ Design notes worth keeping if you rewrite this:
   * It parses the command, it does not grep it. Commands are split into simple
     commands with quotes respected, following cd / pushd / popd, subshells,
     if/then and loops, `$(...)` even inside quotes, `bash -c` / `eval`
-    strings, heredocs fed to a shell, `git -C`, xargs/find wrappers, and git
-    aliases (expanded, so an alias's own remote counts). A heredoc that is only
+    strings, heredocs fed to a shell, `git -C`, xargs/find wrappers, an
+    unquoted `$(...)` as part of its word (git -C $(pwd) push), backslash-newline
+    line joins, a command name written in quotes (g'i't) or as zsh's =git, and
+    git aliases (expanded, so an alias's own remote counts; one defined with
+    `git -c alias.x=...` too, and one from GIT_CONFIG_*, --config-env or an
+    included file, which it cannot read, blocks). A heredoc that is only
     data -- a note, a commit message -- is not read as commands, and neither is
     `git commit -m "... push ..."`. A word-matching gate blocks both of those,
-    and a gate that blocks ordinary work gets switched off.
+    and a gate that blocks ordinary work gets switched off. The one exception:
+    an UNQUOTED heredoc still runs its `$(...)` and backticks, so those are
+    read as commands.
+
+  * It tracks every directory the shell might be in. A cd that might not run
+    -- inside an if, a loop, a case, a function or { } body, a pipeline, the
+    background, a coproc, after `||`, after a step that could fail, or behind
+    env / sudo / timeout, which run an external cd -- keeps the old directory
+    as a candidate, and every candidate is scanned. A bare directory name
+    counts as a cd (zsh's autocd option). Wrapper options that take a value
+    (env -u NAME, nice -n 5, -C/dir glued on, or at the end of a cluster like
+    -iC dir) are skipped with it, a wrapper named by its path (/usr/bin/env)
+    counts, env -C / sudo -D move the command they run, env -S splits its
+    string, and after an option the gate does not know it looks for git / gh
+    / a shell further on. zsh's noglob / nocorrect / - are wrappers, and so is
+    any other command (arch, stdbuf, script) whose arguments include git, gh
+    or a shell -- no list of such programs is ever complete -- except ones that
+    only print or compare (echo, grep, which, command -v, test, [[ ]]).
+    Every such name in the
+    arguments is followed, not just the first (find -name cd -exec git push). A
+    quoted argument that names one is a script (watch 'git push', script -c
+    'echo; git push'), and an option naming git with push further on counts as
+    a push (rg --pre=git . push). A heredoc delimiter may be quoted with any
+    characters ('END-OF-DATA') or by a backslash, and may hold a $ (EOF$x). A
+    << inside
+    quotes or a comment starts no heredoc. Text after # is read both as a
+    comment and as commands, because which one it is depends on the shell; so
+    a comment that names a publish can block in a dirty public repository, a
+    deliberate backstop against a comment-parsing mistake. Scanning only the
+    directory the cd names lets `if false; then cd clean-repo; fi; git push`
+    publish the repository the shell never left.
+
+  * The publishes it knows: git push (with --recurse-submodules=on-demand /
+    only, or that setting, each submodule is scanned as a push of its own; its
+    options are read as git reads them: --mirr is --mirror, -on is `-o n` and
+    no dry run, the last of repeated options wins, and a positional repository
+    beats --repo), and send-pack, subtree push and lfs push, which also send
+    the repository's content; gh repo create / edit / rename / fork, gist
+    create / edit / rename, release, api, label, project, discussion,
+    agent-task create, workflow run, skill publish, and any issue or PR action
+    that posts text (create, comment, close, merge...). gh's flags are read as gh reads them, from its own help (-pw is -p -w,
+    --public=true, -R before the subcommand), and a gh alias -- set in the
+    command or in gh's config -- is read as what it expands to.
 
   * It checks where each publish really goes: every push URL of the named
     remote, or for a bare push the branch's push remote; `--repo` for gh
-    commands; a `gh api` endpoint's repository. An unresolved destination is
+    commands (GH_REPO or GH_HOST set blocks a gh publish that does not name its
+    repository with --repo); a `gh api` endpoint's repository. An unresolved destination is
     public. `--dry-run` publishes nothing.
 
   * It scans what the publish can carry, not just what is on disk: file names
     and contents in the working tree (tracked and untracked; ignored files too
     when the command force-adds), symlink targets as text, the staged index,
-    and every commit the target remote does not have -- diffs, commit messages,
-    branch and tag names, tag messages, and Git LFS objects. Remote-tracking
-    refs only narrow that range when the push URL is also the fetch URL.
+    and every object the target remote does not have -- each blob whole, every
+    file name in each tree, commit and tag messages, branch and tag names, and
+    Git LFS objects. It reads objects, not `git log -p` output: a patch hides
+    content added only by a merge commit, a line crafted to look like a diff
+    header, and a tag that points straight at a blob. A bare repository has no
+    working tree; its objects are scanned. What the remote already has is
+    asked from the remote itself (git ls-remote): remote-tracking refs can be
+    stale, and narrow the range only when the remote cannot be asked and the
+    push URL is also the fetch URL. A remote with commits not fetched here
+    excludes only what this clone has, so it can block until `git fetch`.
     Making a repository public, or creating one from a source directory, scans
     all history; creating one from a non-public template is blocked. Gist
-    files, release assets, and issue, PR, release and API text are scanned
-    directly.
+    files, release assets, issue, PR, release and API text, closing and merge
+    comments, a repository's description, topics and new name, and label
+    names are scanned directly; an edited or renamed gist, and a project's
+    text, whatever their visibility, which is not looked up (making a project
+    public blocks). Text built by $(cat FILE) or $(< FILE) scans
+    FILE, a heredoc inside $(...) is the text itself, and text that is any
+    other command's output, stdin, or a shell variable blocks. A pager or
+    editor setting (git -c core.pager=..., GIT_PAGER=..., man -P ...) is a
+    command line and is read as one; man's page names are not.
 
   * It has no exclude list, deliberately. An exclusion added to quieten noise
     is where unreviewed content collects.
@@ -60,14 +121,21 @@ Design notes worth keeping if you rewrite this:
 Known limits (why the pre-push layer exists):
 
   * Content created by an earlier step of the same command does not exist yet.
-  * Shell is parsed, not run: a script file, a shell function, or a command
-    built from variables can hide a push. A directory built from a variable
-    blocks; a script that pushes is not seen.
+  * Shell is parsed, not run: a script file, a shell alias or function defined
+    outside the command, or a command built from variables can hide a push. A
+    directory or a git subcommand built from a variable blocks, and so does a
+    command name built from one when `push` or another built word follows it;
+    a script that pushes is not seen, nor is a gh command whose name is built
+    from a variable. A gh extension is a program of its own, like a script.
   * Compressed formats (archives, most images) can hide text from a byte scan.
   * It scans every local branch and all untracked files, not only what this
     push sends. That is deliberate -- a script earlier in the command can
     commit anything -- so a private draft sitting in a public repository blocks
     until it is moved out or ignored.
+  * Commit author, committer and tagger header lines are not scanned (a message
+    line that merely starts with one of those words is): they carry the
+    identity git is configured with, which is a question for that config, not
+    for every push.
 
 Hook payload arrives on stdin as JSON. Clients do not pass tool input via
 environment variables.
@@ -77,6 +145,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -96,21 +165,69 @@ DEADLINE = time.monotonic() + BUDGET
 # runner, a monitor) must list it here, or it is an ungated shell.
 SHELL_TOOLS = ("Bash",)
 
-MAYBE_PUBLISH = re.compile(r"\b(?:git|gh)\b")
+MAYBE_PUBLISH = re.compile(r"\b(?:git|gh|push)\b")  # push: a command name built by a variable
 SEPARATOR = re.compile(r"^[;&|()\n]+$")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 REDIRECT = re.compile(r"^\d*(?:>>?|<<?<?-?|>\|)")
-HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+# The delimiter is one shell word, joined from quoted and bare pieces ('EOF'"-x", E"O"F, \EOF).
+# It never starts with a digit, so the shift in $((1<<2)) starts no heredoc.
+HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(?![0-9])((?:'[^'\n]*'|\"[^\"\n]*\"|\\[^\n]"
+                     r"|[^\s;&|<>()'\"`\\])+)")
+QUOTING = re.compile(r"'([^']*)'|\"([^\"]*)\"|\\(.)")
+PLACEHOLDER = re.compile(r"\$\x02(\d+)\x03")  # an unquoted $(...) held out of tokenizing
+HELD = []  # their scripts, by number
 SHELL_WORD = re.compile(r"(?:^|[\s|;&(/])(?:bash|sh|zsh|dash|ksh|fish|eval|\$\{?SHELL\}?)(?=\s|$)")
-REDIRECTING_CONFIG = re.compile(r"^(?:remote|url|branch|lfs)\.", re.IGNORECASE)
+REDIRECTING_CONFIG = re.compile(r"^(?:remote|url|branch|lfs|include|includeif)\.",
+                                re.IGNORECASE)
+ALIAS_SOURCE = re.compile(r"^(?:alias|include|includeif)\.", re.IGNORECASE)
+GH_TARGET_ENV = re.compile(r"^(GH_REPO|GH_HOST)=(.*)", re.S)
 REDIRECTING_ENV = re.compile(r"^GIT_(?:DIR|WORK_TREE|CONFIG\w*)=")
-DIFF_ARGS = ["--text", "--no-color", "-U0", "--src-prefix=@pgsrc@/", "--dst-prefix=@pgdst@/"]
-DIFF_HEADERS = ("+++ @pgdst@/", '+++ "@pgdst@/', "+++ /dev/null")
-KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
+OPERATOR = re.compile(r"&&|\|\||;;&|;;|;&|\|&|[;&|\n()]")
+CASE_END = (";;", ";&", ";;&")
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "coproc"}
+OPENERS = {"if", "while", "until", "for", "select", "case", "{"}  # a body that may not run
+CLOSERS = {"fi", "done", "esac", "}"}
+CASE_WORD = re.compile(r"(?<![\w-])(?:case|esac)(?![\w-])")
+IDENTITY = re.compile(r"^ ?(?:author|committer|tagger) ")
 MAX_DEPTH = 4
-WRAPPERS = {"env", "command", "builtin", "exec", "nohup", "sudo", "nice", "caffeinate", "time"}
+MAX_DIRS = 8
+BATCH_BYTES = 8_000_000
+WRAPPERS = {"env", "command", "builtin", "exec", "nohup", "sudo", "nice", "caffeinate", "time",
+            "noglob", "nocorrect", "-"}
+IN_SHELL = {"command", "builtin", "time", "noglob", "nocorrect", "-"}
+WRAPPER_VALUES = {  # options whose value is the next word, so that word is not the command
+    "env": {"-u", "--unset", "-P", "-C", "--chdir", "-S", "--split-string"},
+    "sudo": {"-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h",
+             "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-U", "--other-user",
+             "-T", "--command-timeout"},
+    "nice": {"-n", "--adjustment"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "caffeinate": {"-t", "-w"},
+    "exec": {"-a"},
+    "time": {"-f", "--format", "-o", "--output"},
+}
+WRAPPER_CHDIR = {"env": {"-C", "--chdir"}, "sudo": {"-D", "--chdir"}}
+WRAPPER_FLAGS = {  # options known to take no value; anything else sends the gate searching
+    "env": {"-", "-i", "-0", "-v", "--ignore-environment", "--null", "--debug"},
+    "sudo": {"-A", "-B", "-b", "-E", "-e", "-H", "-i", "-K", "-k", "-l", "-N", "-n", "-P", "-S",
+             "-s", "-V", "-v"},
+    "timeout": {"-v", "--verbose", "--preserve-status", "--foreground"},
+    "caffeinate": {"-d", "-i", "-m", "-s", "-u"},
+    "exec": {"-c", "-l"},
+    "time": {"-p", "-l", "-h", "-a", "-q", "-v"},
+    "command": {"-p", "-v", "-V"},
+}  # the rest run a separate process: its cd moves nothing
 SHELLS = {"bash", "sh", "zsh", "dash"}
+RUNS_COMMAND = re.compile(r"^(?:\w*_)?(?:PAGER|MANPAGER|EDITOR|VISUAL|BROWSER|SSH_COMMAND)$")
+UNFETCHED = []  # repositories whose remote has commits not fetched here
+DYNAMIC = re.compile(r"[$`{}]")  # a command name built by a variable, substitution or escape
 FANOUT = {"xargs", "find", "parallel", "watch"}
+HANDLED = {"cd", "pushd", "popd", "eval", "git", "gh"} | SHELLS | FANOUT
+# Commands known to never run their arguments. Any other command whose arguments include git, gh
+# or a shell is read as running it: arch, stdbuf, script and the like have no list that is ever
+# complete, and a word missing HERE costs a false block, never a missed push.
+PRINTS_ONLY = {"echo", "printf", "print", "type", "which", "whence", "where", "grep", "egrep",
+               "fgrep", "rg", "test", "[", "[["}
 GIT_BUILTINS = set("""
 add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore
 check-ref-format checkout checkout-index cherry cherry-pick citool clean clone column commit
@@ -124,7 +241,7 @@ rebase reflog remote repack replace request-pull rerere reset restore rev-list r
 rm send-email shortlog show show-branch show-ref sparse-checkout stash status stripspace
 submodule switch symbolic-ref tag unpack-file unpack-objects update-index update-ref
 update-server-info var verify-commit verify-pack verify-tag version whatchanged worktree
-write-tree lfs
+write-tree lfs subtree send-pack
 """.split())
 GITHUB_REPO = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE)
 
@@ -135,37 +252,151 @@ class Parsed:
     def __init__(self):
         self.ops = []            # (kind, dirs, args)
         self.force_add = False
+        self.env_config = False  # GIT_CONFIG_* set: git aliases may come from the environment
+        self.gh_env = None  # GH_REPO / GH_HOST set: gh's repository is not the one here
+        self.gh_aliases = {}  # gh alias set earlier in this command
+        self.gh_alias_opaque = False  # gh aliases from somewhere this gate does not read
+        for key in ("GH_REPO", "GH_HOST"):
+            gh_target(f"{key}={os.environ.get(key, '')}", self)
         self.redirected = False  # git --git-dir / --work-tree
         self.pushd = []
 
 
-def strip_heredocs(command):
+def strip_heredocs(command, comments=False):
     """Drop heredoc bodies that are data (a note, a commit message) so prose mentioning a
     push is not read as one -- a note written this way was falsely blocked. A body fed
-    to a shell (`bash <<EOF`, `cat <<EOF | sh`) is a script and stays. Unterminated: keep all."""
-    out, pos = [], 0
-    for m in HEREDOC.finditer(command):
-        if m.start() < pos:
+    to a shell (`bash <<EOF`, `cat <<EOF | sh`) is a script and stays. An unquoted delimiter
+    still runs the body's $(...) and `...` before the data reaches its reader, so those stay as
+    subshells. Only a << outside quotes (and, when `comments`, outside a comment) starts a
+    heredoc: `echo '<<EOF'` does not, and the lines after it run. Unterminated: keep all."""
+    out, pos, i, quote = [], 0, 0, None
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote or ch in "'\"":
+            quote = None if ch == quote else quote or ch
+            i += 1
+            continue
+        if comments and ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
+            i = command.find("\n", i) if "\n" in command[i:] else len(command)
+            continue
+        m = HEREDOC.match(command, i)
+        if not m:
+            i += 1
             continue
         line_start = command.rfind("\n", 0, m.start()) + 1
         line_end = command.find("\n", m.end())
         if line_end == -1:
             break
         indent = r"[ \t]*" if m.group(1) else ""
-        end = re.compile(rf"^{indent}{re.escape(m.group(3))}[ \t]*$", re.M).search(
+        delimiter = QUOTING.sub(lambda q: next(g for g in q.groups() if g is not None),
+                                m.group(2))
+        quoted = delimiter != m.group(2)  # any quoting makes the body literal
+        end = re.compile(rf"^{indent}{re.escape(delimiter)}[ \t]*$", re.M).search(
             command, line_end + 1)
         if not end:
             break
         out.append(command[pos:line_end + 1])
         if SHELL_WORD.search(command[line_start:line_end]):
             out.append(command[line_end + 1:end.end()])
-        pos = end.end()
+        elif not quoted:
+            out.extend(f"({script})\n" for script in
+                       substitutions(command[line_end + 1:end.start()]))
+        pos = i = end.end()
     out.append(command[pos:])
     return "".join(out)
 
 
-def tokenize(command):
-    command = strip_heredocs(command)
+def strip_comments(command):
+    """Drop `# ...` to the end of the line where a shell word starts with #. Quotes and
+    backslashes keep a # literal, and so does # inside a word (a#b)."""
+    out, i, quote = [], 0, None
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\" and quote != "'":
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
+            end = command.find("\n", i)
+            i = len(command) if end == -1 else end
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def inert_single_quotes(command):
+    """Single quotes make $( and ` plain text. Tokenizing drops the quotes, so mark those first
+    (as \0 and \1) or `echo '$(git push)'` reads as a push; any other $ there, and an
+    escaped \\$ anywhere, becomes \4, so '$5' and "\\$HOME" are not taken for variables. Outside single quotes a
+    backslash-newline joins two lines into one, so `git \\<newline> push` is one command."""
+    out, i, quote = [], 0, None
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\" and quote != "'":
+            if command.startswith("\n", i + 1):
+                i += 2
+                continue
+            out.append("\4" if command.startswith("$", i + 1) else command[i:i + 2])
+            i += 2
+            continue
+        if quote == "'" and ch == "`":
+            ch = "\1"
+        elif quote == "'" and command.startswith("$(", i):
+            ch = "\0"
+        elif quote == "'" and ch == "$":
+            ch = "\4"  # literal, not a variable
+        elif quote:
+            quote = None if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def hold_substitutions(command):
+    """An unquoted $(...) or `...` is part of the word around it: `git -C $(pwd) push` is one
+    command. Tokenizing would split it at its parentheses or spaces and cut the command in two,
+    so each is swapped for a placeholder word first; substitutions() hands its script back. One
+    inside double quotes already stays in its token and is left alone."""
+    out, i, quote = [], 0, None
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\" and quote != "'":
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        if quote != "'" and (command.startswith("$(", i) or ch == "`"):
+            found = substitutions(command[i:])
+            end = i + (2 if ch == "$" else 1) + len(found[0]) + 1 if found else 0
+            if found and command[end - 1:end] == (")" if ch == "$" else "`"):
+                if quote:
+                    out.append(command[i:end])
+                else:
+                    HELD.append(found[0])
+                    out.append(f"$\x02{len(HELD) - 1}\x03")
+                i = end
+                continue
+        if ch in "'\"" and quote in (None, ch):
+            quote = None if quote else ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def tokenize(command, comments=False):
+    command = strip_heredocs(command, comments)
+    if comments:
+        command = strip_comments(command)
+    command = hold_substitutions(inert_single_quotes(command))
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
         lex.whitespace = " \t\r"
@@ -176,17 +407,27 @@ def tokenize(command):
         return re.findall(r"[;&|()\n]+|[^\s;&|()]+", command)
 
 
+def merge(*options):
+    """Every directory the shell may be in. Unknown anywhere is unknown; so is a list too long
+    to keep, because dropping a candidate would drop the directory the shell is really in."""
+    if any(o is None for o in options):
+        return None
+    out = tuple(dict.fromkeys(d for o in options for d in o))
+    return out if len(out) <= MAX_DIRS else None
+
+
 def change_dir(dirs, target):
     """A cd target may not exist yet, or may fail; keep the old dir as a candidate."""
-    if dirs is None or target == "-" or re.search(r"[$`*?]", target):
+    if dirs is None or target == "-" or re.search(r"[$`*?]", target) \
+            or re.match(r"^[+-]\d+$", target):  # a directory-stack entry
         return None
     out = []
     for d in dirs:
         new = os.path.normpath(os.path.join(d, os.path.expanduser(target)))
         out.append(new)
-        if not os.path.isdir(new):
+        if not (os.path.isdir(new) and os.access(new, os.X_OK)):
             out.append(d)
-    return tuple(dict.fromkeys(out))[:4]
+    return merge(out)
 
 
 def strip_redirects(cmd):
@@ -208,22 +449,35 @@ def substitutions(token):
     token after tokenizing, but the shell still runs it."""
     out, i = [], 0
     while i < len(token):
-        if token.startswith("$(", i):
-            depth, j, quote = 1, i + 2, None
+        held = PLACEHOLDER.match(token, i)
+        if held:
+            out.append(HELD[int(held.group(1))])
+            i = held.end()
+        elif token.startswith("$(", i):
+            depth, j, quote, cases = 1, i + 2, None, 0
             while j < len(token) and depth:
                 ch = token[j]
+                word = CASE_WORD.match(token, j)
+                if ch == "\\" and quote != "'":  # an escaped ) or quote is just a character
+                    j += 2
+                    continue
                 if quote:
                     quote = None if ch == quote else quote
                 elif ch in "'\"":
                     quote = ch
-                else:
+                elif word:
+                    cases += 1 if word.group() == "case" else -1 if cases else 0
+                    j = word.end() - 1
+                elif not cases:  # inside a case, `pattern)` is not a closing paren
                     depth += {"(": 1, ")": -1}.get(ch, 0)
                 j += 1
             out.append(token[i + 2:j - 1])
             i = j
         elif token[i] == "`":
-            j = token.find("`", i + 1)
-            if j == -1:
+            j = i + 1
+            while j < len(token) and token[j] != "`":
+                j += 2 if token[j] == "\\" else 1
+            if j >= len(token):
                 break
             out.append(token[i + 1:j])
             i = j + 1
@@ -232,69 +486,148 @@ def substitutions(token):
     return out
 
 
+CASE = object()
+
+
 def walk(tokens, dirs, parsed, depth=0):
+    """Returns the directories the shell may be in afterwards. A directory change is certain
+    only when it runs unconditionally: not after || or inside a pipeline, the background, or an
+    if / loop / case / { } body (a function body is one). Otherwise the old directory stays a
+    candidate. After `a && cd x`, x holds for the rest of that && chain; once the chain ends,
+    the directory from before any step that could have stopped it stays a candidate too."""
     stack, cmd = [], []
+    cond, before = 0, ";"
+    start, stops = dirs, ()  # where this and-or list began; where it may have stopped early
     for tok in tokens + [";"]:
-        if SEPARATOR.match(tok):
-            if cmd:
-                dirs = simple_command(cmd, dirs, parsed, depth)
-                cmd = []
-            for ch in tok:
-                if ch == "(":
-                    stack.append(dirs)
-                elif ch == ")" and stack:
-                    dirs = stack.pop()
+        if not SEPARATOR.match(tok):
+            for script in substitutions(tok):
+                nested(script, dirs, parsed, depth)
+            cmd.append(tok)
             continue
-        for script in substitutions(tok):
-            nested(script, dirs, parsed, depth)
-        cmd.append(tok)
+        ops = OPERATOR.findall(tok)
+        if cmd:
+            detached, i = False, 0
+            while i < len(cmd):
+                word = cmd[i]
+                if word == "function":  # `function name { ... }`
+                    i += 2
+                    continue
+                if word == "case":
+                    stack.append(CASE)  # its `pattern)` closes no subshell
+                if word in OPENERS:
+                    cond += 1
+                elif word in CLOSERS:
+                    cond = max(0, cond - 1)
+                    if word == "esac" and stack and stack[-1] is CASE:
+                        stack.pop()
+                elif word == "coproc":
+                    detached = True
+                elif word not in KEYWORDS:
+                    break
+                i += 1
+            new = simple_command(cmd, dirs, parsed, depth)
+            if new != dirs:
+                after = ops[0] if ops else ";"
+                if before == "&&":
+                    stops = merge(stops, dirs)
+                if cond or detached or before in ("||", "|", "|&") \
+                        or after in ("|", "|&", "&"):
+                    new = merge(dirs, new)
+                dirs = new
+            cmd = []
+        for op in ops:
+            if op == "(":
+                stack.append((dirs, start, stops, cond))
+                start, stops, before = dirs, (), ";"
+            elif op == ")":
+                if stack and stack[-1] is not CASE:
+                    dirs, start, stops, cond = stack.pop()
+                before = ";"
+            elif op in (";", "\n", "&") + CASE_END:
+                dirs = merge(dirs, stops)
+                start, stops, before = dirs, (), ";"
+            elif op == "||":
+                dirs = merge(start, stops, dirs)
+                before = op
+            else:
+                before = op
     return dirs
 
 
 def nested(script, dirs, parsed, depth):
     """Parse a script the shell will run: a substitution, a -c string, eval, an alias. Past
-    the depth limit, block instead of silently stopping."""
+    the depth limit, block instead of silently stopping. Returns the directories afterwards,
+    which only eval keeps (it runs in this shell)."""
     if depth >= MAX_DEPTH:
         if MAYBE_PUBLISH.search(script):
             parsed.ops.append(("unseen", dirs, ["commands nested too deeply to check"]))
-        return
-    walk(tokenize(script), dirs, parsed, depth + 1)
+        return None
+    return walk(tokenize(script), dirs, parsed, depth + 1)
 
 
 def simple_command(cmd, dirs, parsed, depth):
     cmd = strip_redirects(cmd)
-    i = 0
+    shell_dirs = dirs  # a wrapper's chdir moves only the command it runs
+    i, external, wrapped, unknown = 0, False, False, False
     while i < len(cmd):
         if ASSIGNMENT.match(cmd[i]) or cmd[i] in KEYWORDS:
+            runs_command(cmd[i], dirs, parsed, depth)
             if REDIRECTING_ENV.match(cmd[i]):
                 parsed.redirected = True
+            parsed.env_config = parsed.env_config or cmd[i].startswith("GIT_CONFIG")
+            gh_target(cmd[i], parsed)
             i += 1
-        elif cmd[i] in WRAPPERS:
+        elif cmd[i] == "function":
+            i += 2
+        elif command_name(cmd[i]) in WRAPPERS | {"timeout"}:
+            wrapper, wrapped = command_name(cmd[i]), True
+            external = external or wrapper not in IN_SHELL
             i += 1
             while i < len(cmd) and cmd[i].startswith("-"):
-                i += 1
-        elif cmd[i] == "timeout":
-            i += 1
-            while i < len(cmd) and cmd[i].startswith("-"):
-                i += 1
-            i += 1  # the duration
+                if cmd[i] == "--":
+                    i += 1
+                    break
+                opt, value, i, known = wrapper_option(wrapper, cmd, i)
+                unknown = unknown or not known
+                if wrapper == "command" and not opt.startswith("--") and set(opt) & set("vV"):
+                    return shell_dirs  # command -v / -V only names the command
+                if opt in WRAPPER_CHDIR.get(wrapper, ()):
+                    dirs = change_dir(dirs, value)
+                elif wrapper == "env" and opt in ("-S", "--split-string"):
+                    nested(" ".join([value] + cmd[i:]), dirs, parsed, depth)
+                    return shell_dirs
+            if wrapper == "timeout":
+                i += 1  # the duration
         else:
             break
     cmd = cmd[i:]
     if not cmd:
-        return dirs
-    word, args = os.path.basename(cmd[0]), cmd[1:]
+        return shell_dirs
+    word, args = command_name(cmd[0]), cmd[1:]
+    if DYNAMIC.search(word) and ("push" in args or args and DYNAMIC.search(args[0])
+                                 and "/" not in args[0]):  # "$g" "$p": maybe git push
+        parsed.ops.append(("unseen", dirs, ["a command name built by a variable or "
+                                            "substitution, with push or a built subcommand"]))
+        return shell_dirs
+    if word in ("export", "declare", "typeset"):
+        for a in args:
+            runs_command(a, dirs, parsed, depth)
+            gh_target(a, parsed)
+            if REDIRECTING_ENV.match(a):
+                parsed.redirected = True  # every later git uses it, as a prefix would
+    if word in ("export", "declare", "typeset") and any(a.startswith("GIT_CONFIG") for a in args):
+        parsed.env_config = True  # an alias defined there applies to every later git
+    if wrapped and unknown and word not in HANDLED:
+        # An option this gate does not know may have taken a value: find the command anyway.
+        run_arguments(cmd[1:], dirs, parsed, depth)
+        return shell_dirs
 
-    if word in ("cd", "pushd"):
-        targets = [a for a in args if a == "-" or not a.startswith("-")]
-        if word == "pushd":
-            parsed.pushd.append(dirs)
-        return change_dir(dirs, targets[0] if targets else "~")
-    if word == "popd":
-        return parsed.pushd.pop() if parsed.pushd else None
-    if word == "eval":
-        nested(" ".join(args), dirs, parsed, depth)
-    elif word in SHELLS:
+    if word in ("cd", "pushd", "popd", "eval"):
+        moved = move(word, args, dirs, parsed, depth)
+        return merge(shell_dirs, moved) if external else moved
+    if not args and not external and is_autocd(cmd[0], dirs):
+        return merge(dirs, change_dir(dirs, cmd[0]))  # bash has no autocd: it may stay put
+    if word in SHELLS:
         for j, a in enumerate(args):
             if re.match(r"^-[a-z]*c[a-z]*$", a) and j + 1 < len(args):
                 nested(args[j + 1], dirs, parsed, depth)
@@ -302,23 +635,124 @@ def simple_command(cmd, dirs, parsed, depth):
     elif word == "git":
         git_command(args, dirs, parsed, depth)
     elif word == "gh":
-        gh_command(args, dirs, parsed)
-    elif word in FANOUT and "git" in args:
-        git_command(args[args.index("git") + 1:], dirs, parsed, depth)
-    return dirs
+        gh_command(args, dirs, parsed, depth)
+    elif word == "man":  # page names are data; -P / -H name a command it runs
+        for k, a in enumerate(args):
+            for opt in ("--pager", "--html", "-P", "-H"):
+                if a == opt and k + 1 < len(args):
+                    nested(args[k + 1], dirs, parsed, depth)
+                elif a.startswith(opt) and a != opt:
+                    nested(a[len(opt):].lstrip("="), dirs, parsed, depth)
+                    break
+    elif word in FANOUT or word not in HANDLED | PRINTS_ONLY \
+            or word == "rg" and any(a.startswith("--pre") for a in args):  # rg --pre runs one
+        run_arguments(args, dirs, parsed, depth)
+    return shell_dirs
+
+
+def run_arguments(args, dirs, parsed, depth):
+    """Read the arguments of a command that may run them. Every word naming git, gh or a
+    shell may start the command it runs (an earlier one may be a file name or a value); a single quoted word holding several words that name one
+    anywhere (watch 'git push', script -c 'echo; git push', flock f -c '...', man -P '...') is
+    a script of its own."""
+    for k, a in enumerate(args):
+        named = a.partition("=")[2] if a.startswith("-") else a
+        if command_name(named) == "git" and "push" in args[k + 1:]:
+            # it may add words of its own: rg --pre=git . push runs `git push`
+            parsed.ops.append(("push", dirs, []))
+        if DYNAMIC.search(command_name(named)) and re.search(r"git|gh", named, re.I) \
+                and "push" in args[k + 1:]:
+            parsed.ops.append(("unseen", dirs, ["a push whose command name is built by a "
+                                                "variable or substitution"]))
+        if command_name(a) in HANDLED:  # and keep looking: find -name cd -exec git push
+            simple_command(args[k:], dirs, parsed, depth)
+        if len(a.split()) > 1 and MAYBE_PUBLISH.search(a):
+            nested(a, dirs, parsed, depth)
+
+
+def runs_command(assignment, dirs, parsed, depth):
+    """PAGER=, GIT_PAGER=, MANPAGER=, EDITOR=, VISUAL=, BROWSER=, GIT_SSH_COMMAND= name a
+    command line the program runs: read it as one."""
+    name, _, value = assignment.partition("=")
+    if RUNS_COMMAND.match(name) and MAYBE_PUBLISH.search(value):
+        nested(value, dirs, parsed, depth)
+
+
+def command_name(word):
+    """The program a command word names. zsh expands `=git` to git's path (EQUALS option)."""
+    return os.path.basename(word[1:] if word.startswith("=") else word)
+
+
+def wrapper_option(wrapper, cmd, i):
+    """(option, value, next index, recognised) for the option word at cmd[i]. A value may be
+    the next word, glued on (-C/dir, -S'git push'), or end a short-option cluster (-iC dir)."""
+    tok = cmd[i]
+    values, flags = WRAPPER_VALUES.get(wrapper, set()), WRAPPER_FLAGS.get(wrapper, set())
+    following = cmd[i + 1] if i + 1 < len(cmd) else ""
+    if tok.startswith("--"):
+        opt, eq, value = tok.partition("=")
+        if opt in values:
+            return (opt, value, i + 1, True) if eq else (opt, following, i + 2, True)
+        return opt, value, i + 1, opt in flags
+    known = True
+    for k in range(1, len(tok)):
+        opt = "-" + tok[k]
+        if opt in values:
+            rest = tok[k + 1:]
+            return (opt, rest, i + 1, known) if rest else (opt, following, i + 2, known)
+        known = known and opt in flags
+    return tok, "", i + 1, known if len(tok) > 1 else tok in flags
+
+
+def is_autocd(word, dirs):
+    """zsh's autocd: a bare directory name that is not a command is a cd."""
+    return bool(dirs) and shutil.which(word) is None and any(
+        os.path.isdir(os.path.join(d, os.path.expanduser(word))) for d in dirs)
+
+
+def move(word, args, dirs, parsed, depth):
+    """The directories after cd / pushd / popd / eval."""
+    if word == "eval":
+        return nested(" ".join(args), dirs, parsed, depth)
+    if word == "popd":
+        if args:  # popd +N / -N drops an entry the stack model does not track
+            return None
+        return parsed.pushd.pop() if parsed.pushd else None
+    targets, options = [], True
+    for a in args:
+        if options and a == "--":
+            options = False
+        elif not (options and a.startswith("-") and a != "-" and not re.match(r"^[+-]\d+$", a)):
+            targets.append(a)
+    if word == "pushd":
+        parsed.pushd.append(dirs)
+    if len(targets) > 1 or (word == "pushd" and not targets):
+        return None  # zsh `cd old new` rewrites the path; a bare pushd swaps the stack
+    return change_dir(dirs, targets[0] if targets else "~")
 
 
 def git_command(args, dirs, parsed, depth):
-    i = 0
+    i, inline, opaque, recurse = 0, {}, parsed.env_config, []
     while i < len(args) and args[i].startswith("-"):
         a = args[i]
         if a == "-C":
             dirs = change_dir(dirs, args[i + 1]) if i + 1 < len(args) else None
             i += 2
-        elif a in ("-c", "--config-env"):
-            if i + 1 < len(args) and REDIRECTING_CONFIG.match(args[i + 1]):
+        elif a in ("-c", "--config-env") or a.startswith("--config-env="):
+            glued = a.startswith("--config-env=")
+            setting = a.partition("=")[2] if glued else args[i + 1] if i + 1 < len(args) else ""
+            if REDIRECTING_CONFIG.match(setting):
                 parsed.redirected = True  # e.g. -c remote.origin.url=...: a destination we
-            i += 2                        # cannot see through `git remote`
+            key, _, value = setting.partition("=")  # cannot see through `git remote`
+            if len(value.split()) > 1 and MAYBE_PUBLISH.search(value):
+                nested(value.lstrip("!"), dirs, parsed, depth)  # core.pager, core.editor...
+            if key.lower() == "push.recursesubmodules":
+                recurse = [f"--recurse-submodules={value}"]  # before the command's own flags
+            if a == "-c" and key.lower().startswith("alias."):
+                inline[key[6:].lower()] = value
+            elif ALIAS_SOURCE.match(key):
+                opaque = True  # an alias from an environment variable or an included file
+            i += 1 if glued else 2
         elif a == "--namespace":
             i += 2
         elif a.split("=")[0] in ("--git-dir", "--work-tree"):
@@ -329,14 +763,33 @@ def git_command(args, dirs, parsed, depth):
     if i >= len(args):
         return
     sub, rest = args[i], args[i + 1:]
-    if sub == "push":
-        if not any(r == "--dry-run" or re.match(r"^-[a-zA-Z]*n[a-zA-Z]*$", r) for r in rest):
-            parsed.ops.append(("push", dirs, rest))
+    if re.search(r"[$`]", sub):
+        parsed.ops.append(("unseen", dirs, ["a git subcommand built from a variable"]))
+    elif sub in ("push", "send-pack"):  # send-pack: the plumbing behind push (a URL, refs)
+        opts, words = push_args(recurse + rest)
+        if not dry_run(opts):
+            parsed.ops.append(("push", dirs, opts + ["--"] + words))
+    elif sub in ("subtree", "lfs") and "push" in rest:
+        # Both send to <repository>; what they send comes from this repo's history and LFS
+        # store, which a push scan covers whole when given no refspec.
+        words = positionals(rest, {"-P", "--prefix", "-b", "--branch", "--onto", "--annotate",
+                                   "-m", "--message"})
+        if (sub == "subtree" or "--dry-run" not in rest) and "push" in words:  # subtree has none
+            k = words.index("push")
+            parsed.ops.append(("push", dirs, words[k + 1:k + 2]))
     elif sub == "add":
-        if any(r == "--force" or re.match(r"^-[a-zA-Z]*f", r) for r in rest):
+        if any(r.startswith("--f") and "--force".startswith(r) or re.match(r"^-[a-zA-Z]*f", r)
+               for r in rest):  # --forc: git takes any unique prefix of an option
             parsed.force_add = True
     elif sub == "submodule" and "push" in rest:
         parsed.ops.append(("unseen", dirs, ["a push inside `git submodule foreach`"]))
+    elif sub.lower() in inline:
+        alias = inline[sub.lower()]
+        script = alias[1:] if alias.startswith("!") else "git " + alias
+        nested(script + " " + shlex.join(rest), dirs, parsed, depth)
+    elif sub not in GIT_BUILTINS and opaque:
+        parsed.ops.append(("unseen", dirs, ["a git alias defined where this gate cannot read "
+                                            "it (GIT_CONFIG_*, --config-env, include)"]))
     elif sub not in GIT_BUILTINS and dirs:
         # Expand the alias itself: `!git push public main` carries its own destination.
         for d in existing(dirs):
@@ -346,27 +799,251 @@ def git_command(args, dirs, parsed, depth):
                 nested(script + " " + shlex.join(rest), (d,), parsed, depth)
 
 
-def gh_command(args, dirs, parsed):
-    group, action = (args + ["", ""])[:2]
-    rest = args[2:]
+def gh_target(word, parsed):
+    """Note a GH_REPO / GH_HOST assignment: it applies to this gh and every later one."""
+    if re.match(r"(GH_CONFIG_DIR|XDG_CONFIG_HOME)=", word):
+        parsed.gh_alias_opaque = True  # gh's aliases then come from another config
+    m = GH_TARGET_ENV.match(word)
+    if m and m.group(2) and not (m.group(1) == "GH_HOST" and m.group(2) == "github.com"):
+        parsed.gh_env = "GH_HOST" if "GH_HOST" in (m.group(1), parsed.gh_env) else "GH_REPO"
+
+
+GH_GROUPS = {"repo", "gist", "release", "issue", "pr", "api", "discussion", "label", "project",
+             "agent-task", "workflow", "skill", "alias"}  # gh's own: never an alias
+GH_FLAG_LINE = re.compile(r"^\s+(?:-(\S), )?--([\w-]+)(?: (\S+))?(?:\s{2,}|$)")
+PFLAG_FALSE = {"0", "f", "F", "false", "FALSE", "False"}
+_gh_flags = {}
+_gh_aliases = []
+
+
+def gh_flags(command):
+    """{flag: (long name, takes a value)} for one of gh's own commands, read from that gh's
+    help (inherited flags included), or None when it cannot be read. Never asked of an alias
+    or an extension: `gh <that> --help` would run it."""
+    key = tuple(command)
+    if key not in _gh_flags:
+        table = {}
+        for line in (run(["gh", *command, "--help"], None) or "").splitlines():
+            m = GH_FLAG_LINE.match(line)
+            if m:
+                entry = ("--" + m.group(2), m.group(3) is not None)
+                table[entry[0]] = entry
+                if m.group(1):
+                    table["-" + m.group(1)] = entry
+        _gh_flags[key] = table or None
+    return _gh_flags[key]
+
+
+def gh_args(args, table):
+    """A gh command line read as gh's own flag parser (pflag) reads it: bundled short flags
+    (-pw), a value glued (-dText, -d=Text) or in the next word, a bool given a value
+    (--public=true; --public=false is dropped). Each flag comes back as one word, --NAME or
+    --NAME=VALUE, ahead of the positional words. A flag this gh does not know is kept as
+    written (gh refuses it). Without a table the words come back unchanged."""
+    if not table:
+        return list(args)
+    flags, words, i = [], [], 0
+    while i < len(args):
+        a, i = args[i], i + 1
+        if a == "--":
+            words += args[i - 1:]
+            break
+        if a.startswith("--"):
+            name, eq, value = a.partition("=")
+            long, takes = table.get(name, (None, None))
+            if long is None:
+                flags.append(a)
+            elif not takes:
+                if not eq or value not in PFLAG_FALSE:
+                    flags.append(long)
+            else:
+                if not eq and i < len(args):
+                    value, i = args[i], i + 1
+                flags.append(f"{long}={value}")
+        elif a.startswith("-") and len(a) > 1:
+            k = 1
+            while k < len(a):
+                long, takes = table.get("-" + a[k], (None, None))
+                if long is None:
+                    flags.append("-" + a[k:])
+                    break
+                glued, k = a[k + 1:], k + 1
+                if takes:
+                    value = glued[1:] if glued.startswith("=") else glued
+                    if not glued and i < len(args):
+                        value, i = args[i], i + 1
+                    flags.append(f"{long}={value}")
+                    break
+                if glued.startswith("="):  # -p=false
+                    if glued[1:] not in PFLAG_FALSE:
+                        flags.append(long)
+                    break
+                flags.append(long)
+        else:
+            words.append(a)
+    return flags + words
+
+
+def split_action(args, table):
+    """(subcommand, the other words): a flag of the group may come first, as in
+    gh issue -R owner/repo create."""
+    i = 0
+    while i < len(args) and args[i] != "--":
+        a = args[i]
+        if not a.startswith("-") or a == "-":
+            return a, args[:i] + args[i + 1:]
+        _, takes = (table or {}).get(a.partition("=")[0] if a.startswith("--") else a[:2],
+                                     (None, False))
+        i += 2 if takes and "=" not in a and (a.startswith("--") or len(a) == 2) else 1
+    return "", list(args)
+
+
+def gh_alias_list():
+    """gh's configured aliases ({name: expansion}; None where it could not be read). The list
+    is YAML: a value that needs it is quoted."""
+    if not _gh_aliases:
+        found = {}
+        for line in (run(["gh", "alias", "list"], None) or "").splitlines():
+            name, sep, value = line.partition(": ")
+            if not sep:
+                continue
+            if value[:1] == "'" and value[-1:] == "'" and len(value) > 1:
+                value = value[1:-1].replace("''", "'")
+            elif value[:1] == '"':
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    value = None
+            found[name] = value
+        _gh_aliases.append(found)
+    return _gh_aliases[0]
+
+
+def gh_alias(args, dirs, parsed, depth):
+    """gh <alias>: one set earlier in this command, or in gh's config, is walked as what it
+    expands to (a ! alias through the shell). Anything else is an extension, a program of its
+    own like any script, or one of gh's reads."""
+    name = args[0] if args else ""
+    known = parsed.gh_aliases if name in parsed.gh_aliases else gh_alias_list()
+    if name not in known:
+        if parsed.gh_alias_opaque:
+            parsed.ops.append(("unseen", dirs, ["a gh alias this gate cannot read"]))
+        return
+    expansion = known[name]
+    if expansion is None:
+        parsed.ops.append(("unseen", dirs, ["a gh alias this gate cannot read"]))
+    elif expansion.startswith("!"):
+        nested(expansion[1:], dirs, parsed, depth)  # its arguments are $1, $2...: unseen text
+    else:
+        extra = []
+        for n, a in enumerate(args[1:], 1):  # as gh expands: $N replaced, the rest appended
+            if "$" in expansion:
+                expansion = expansion.replace(f"${n}", a)
+            else:
+                extra.append(a)
+        try:
+            nested(shlex.join(["gh", *shlex.split(expansion), *extra]), dirs, parsed, depth)
+        except ValueError:
+            parsed.ops.append(("unseen", dirs, ["a gh alias this gate cannot read"]))
+
+
+def gh_command(args, dirs, parsed, depth=0):
+    group = args[0] if args else ""
+    if group not in GH_GROUPS:
+        gh_alias(args, dirs, parsed, depth)
+        return
+    if group == "api":
+        action, rest = "", gh_args(args[1:], gh_flags(["api"]))
+    else:
+        table = gh_flags([group])
+        if table is None and args[1:2] and args[1].startswith("-"):
+            parsed.ops.append(("unseen", dirs, ["gh flags this gate could not read"]))
+            return
+        action, rest = split_action(args[1:], table)
+        rest = gh_args(rest, gh_flags([group, action]) if action else None)
+    before = len(parsed.ops)
+    gh_ops(group, action, rest, dirs, parsed)
+    if parsed.gh_env and len(parsed.ops) > before \
+            and (parsed.gh_env == "GH_HOST" or not flag_values(rest, "--repo", "-R")):
+        del parsed.ops[before:]
+        parsed.ops.append(("unseen", dirs, [f"{parsed.gh_env} is set, so gh may publish to a "
+                                            "repository this gate does not resolve (name it "
+                                            "with --repo instead)"]))
+
+
+def gh_ops(group, action, rest, dirs, parsed):
+    repo = (flag_values(rest, "--repo", "-R") or [None])[0]
+
+    def text(texts, target=repo, files=(), kind="text"):
+        if texts or files:
+            parsed.ops.append((kind, dirs, [*([f"--repo={target}"] if target else []),
+                                            *(f"--body={t}" for t in texts),
+                                            *(f"--body-file={f}" for f in files)]))
+
+    words = positionals(rest, {"--repo", "-R"})
     if group == "repo" and action == "create":
         parsed.ops.append(("repo-create", dirs, rest))
     elif group == "repo" and action == "edit":
-        if "public" in flag_values(rest, "--visibility"):
+        if "public" in (v.lower() for v in flag_values(rest, "--visibility")):
             parsed.ops.append(("make-public", dirs, rest))
+        named = positionals(rest, REPO_EDIT_VALUES)[:1]
+        # shown on the repository's page
+        text(flag_values(rest, "--description", "-d", "--homepage", "-h", "--add-topic"),
+             named[0] if named else None)
+    elif group == "repo" and action == "rename":  # the new name
+        text(words[:1])
+    elif group == "repo" and action == "fork":  # a fork of a public repository is public
+        text(flag_values(rest, "--fork-name"), (words or [None])[0])
     elif group == "gist" and action == "create":
         parsed.ops.append(("gist", dirs, rest))
+    elif group == "gist" and action == "edit":
+        parsed.ops.append(("gist-edit", dirs, rest))
+    elif group == "gist" and action == "rename":  # an existing gist: visibility not looked up
+        text(words[2:3], kind="text-anywhere")
     elif group == "release" and action in ("create", "upload", "edit"):
         parsed.ops.append(("release-" + action, dirs, rest))
-    elif group in ("issue", "pr") and action in ("create", "comment", "edit", "review"):
-        parsed.ops.append(("text", dirs, rest))
+    elif group in ("issue", "pr", "discussion") and action not in GH_READS:
+        parsed.ops.append(("text", dirs, rest))  # close / reopen / merge post text too
         if group == "pr" and action == "create" and not flag_values(rest, "--head", "-H"):
             parsed.ops.append(("push", dirs, []))  # gh may push the branch first
+    elif group == "label" and action in ("create", "edit"):
+        text(words[:1] + flag_values(rest, "--description", "-d", "--name", "-n"))
+    elif group == "label" and action == "clone":
+        parsed.ops.append(("label-clone", dirs, rest))
+    elif group == "project":  # a project's visibility is not looked up: its text always counts
+        if "public" in (v.lower() for v in flag_values(rest, "--visibility")):
+            parsed.ops.append(("unseen", dirs, ["a project made public (its items are not "
+                                                "scanned)"]))
+        text(flag_values(rest, "--title", "--description", "-d", "--readme", "--body", "--text",
+                         "--value", "--name", "--single-select-options"), kind="text-anywhere")
+    elif group == "agent-task" and action == "create":  # the task and its pull request
+        text(words[:1], files=flag_values(rest, "--from-file", "-F"))
+    elif group == "workflow" and action == "run":  # inputs of a run in a public repository
+        fields = [f.partition("=")[2] for f in flag_values(rest, "-f", "--raw-field", "-F",
+                                                              "--field")]
+        text([f for f in fields if not f.startswith("@")],
+             files=[f[1:] for f in fields if f.startswith("@")]
+             + (["-"] if "--json" in rest else []))
+    elif group == "skill" and action == "publish" and "--dry-run" not in rest:
+        parsed.ops.append(("push", dirs, []))  # a release of this repository's skills
+    elif group == "alias" and action == "set":
+        named = positionals(rest, set())
+        if len(named) >= 2 and named[1] != "-":
+            parsed.gh_aliases[named[0]] = ("!" if "--shell" in rest else "") + named[1]
+        else:
+            parsed.gh_alias_opaque = True
+    elif group == "alias" and action == "import":
+        parsed.gh_alias_opaque = True
     elif group == "api":
-        parsed.ops.append(("api", dirs, args[1:]))
+        parsed.ops.append(("api", dirs, rest))
 
 
 # ------------------------------------------------------------ arguments
+
+GH_READS = {"", "list", "view", "status", "checks", "diff", "checkout", "develop"}
+REPO_EDIT_VALUES = {"--visibility", "--description", "-d", "--homepage", "-h", "--default-branch",
+                    "--add-topic", "--remove-topic", "--squash-merge-commit-message"}
+
 
 def flag_values(args, *names):
     out = []
@@ -376,7 +1053,62 @@ def flag_values(args, *names):
                 out.append(args[j + 1])
             elif name.startswith("--") and a.startswith(name + "="):
                 out.append(a[len(name) + 1:])
+            elif len(name) == 2 and a.startswith(name) and len(a) > 2:  # -fVALUE
+                out.append(a[2:])
     return out
+
+
+PUSH_LONG = ("--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules",
+             "--remote", "--no-recurse-submodules", "--mirror", "--stdin", "--dry-run",
+             "--no-dry-run")
+PUSH_VALUED = {"--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules",
+               "--remote"}  # every push / send-pack option whose value may be the next word
+
+
+def push_args(args):
+    """A push / send-pack command line read as git's own option parser reads it: any unique
+    prefix of a long option (--mirr, --rep=URL), a value in the next word even when it looks
+    like an option (-o --dry-run, --recurse-submodules only), short flags bundled (-fn) or
+    with a glued value (-on is `-o n`, not a dry run). Returns the options in order, spelled
+    out as NAME or NAME=VALUE, and the positional words. A prefix of several options is
+    left as written: git refuses it."""
+    opts, words, i = [], [], 0
+    while i < len(args):
+        a, i = args[i], i + 1
+        if a == "--":
+            words += args[i:]
+            break
+        if a.startswith("--"):
+            name, eq, value = a.partition("=")
+            hits = [n for n in PUSH_LONG if n.startswith(name)]
+            if name not in PUSH_LONG and len(hits) == 1:
+                name = hits[0]
+            if name in PUSH_VALUED and not eq and i < len(args):
+                value, eq, i = args[i], "=", i + 1
+            opts.append(name + eq + value)
+        elif a.startswith("-") and a != "-":
+            for k, ch in enumerate(a[1:], 2):
+                if ch == "o":  # -o takes the rest of the word, or the next word
+                    value = a[k:]
+                    if not value and i < len(args):
+                        value, i = args[i], i + 1
+                    opts.append("--push-option=" + value)
+                    break
+                opts.append("-" + ch)
+        else:
+            words.append(a)
+    return opts, words
+
+
+def dry_run(opts):
+    """The last of --dry-run / -n / --no-dry-run wins, as in git."""
+    dry = False
+    for o in opts:
+        if o in ("--dry-run", "-n"):
+            dry = True
+        elif o == "--no-dry-run":
+            dry = False
+    return dry
 
 
 def positionals(args, value_flags):
@@ -400,6 +1132,37 @@ def run(args, cwd):
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         return None
+
+
+def git_bytes(args, cwd, stdin=b""):
+    """Raw git output within the scan's time budget, or None when git fails."""
+    remaining = DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, input=stdin, capture_output=True,
+                           timeout=remaining)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError
+    except OSError:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def locate(d):
+    """(repository root, has a working tree), or (None, False) outside any repository. A bare
+    repository, or a .git directory, can push without a working tree."""
+    top = git_path(["rev-parse", "--show-toplevel"], d)
+    if top:
+        return top, True
+    return git_path(["rev-parse", "--absolute-git-dir"], d), False
+
+
+def git_path(args, cwd):
+    """A path git prints, only its record-ending newline removed: a folder name may end in a
+    space, and trimming it would name a different folder."""
+    out = git_bytes(args, cwd)
+    return os.fsdecode(out[:-1]) if out and out.endswith(b"\n") else None
 
 
 def repo_slug(target):
@@ -437,6 +1200,60 @@ def push_remote(cwd):
     return "origin"
 
 
+def submodule_push(opts, root):
+    """on-demand / only when this push also pushes submodules (the last --recurse-submodules=
+    or --no-recurse-submodules, or the push.recurseSubmodules setting); None otherwise.
+    `check` only verifies."""
+    value = None
+    for o in opts:
+        if o == "--no-recurse-submodules":
+            value = "no"
+        elif o.startswith("--recurse-submodules="):
+            value = o.partition("=")[2]
+    if value is None:
+        value = run(["git", "config", "--get", "push.recurseSubmodules"], root)
+    return value if value in ("on-demand", "only") else None
+
+
+def gitlinks(root):
+    """Paths of the submodules this repository records."""
+    raw = git_bytes(["ls-files", "-s", "-z"], root) or b""
+    return [entry.partition("\t")[2] for entry in raw.decode("utf-8", "replace").split("\0")
+            if entry.startswith("160000 ")]
+
+
+def remote_has(urls, root):
+    """What every push URL already has and this clone also has, asked from the remotes
+    themselves (git ls-remote), or None when one cannot be asked. Tracking refs can be stale: a remote rewound elsewhere
+    still looks up to date here, and the commits it lost would ship unscanned."""
+    have = None
+    for url in urls:
+        remaining = min(20.0, DEADLINE - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError
+        try:
+            r = subprocess.run(["git", "ls-remote", url], cwd=root, capture_output=True,
+                               text=True, errors="replace", timeout=remaining,
+                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if r.returncode:
+            return None
+        shas = {line.split()[0] for line in r.stdout.splitlines() if line.strip()}
+        have = shas if have is None else have & shas
+    if have:  # only commits present here can be excluded; the rest were never fetched
+        found = git_bytes(["cat-file", "--batch-check"], root,
+                          "".join(f"{h}\n" for h in sorted(have)).encode())
+        if found is None:
+            return None
+        missing = {ln.split()[0] for ln in found.decode("utf-8", "replace").splitlines()
+                   if ln.endswith(" missing")}
+        if missing:  # what they sit on top of is unknown: stale tracking refs prove nothing
+            UNFETCHED.append(root)
+            have -= missing
+    return sorted(have or ())
+
+
 def outgoing_range(root, remote, refspecs=()):
     """The `git log` range a push to `remote` can publish, or None when every push URL is
     private. An unknown remote has no URL and counts as public."""
@@ -456,10 +1273,14 @@ def outgoing_range(root, remote, refspecs=()):
     if "--mirror" in refspecs or any("*" in s or re.match(r"refs/(?!heads/|tags/)", s)
                                      for s in sources):
         refs = ["--all"]
-    else:  # HEAD: a detached HEAD pushed by name; any other source a refspec names
+    else:  # HEAD: a detached HEAD pushed by name; any other object a refspec names
         refs = ["--branches", "--tags", "HEAD"] + [
             s for s in sources if s and s != "HEAD"
-            and run(["git", "rev-parse", "--verify", "-q", s + "^{commit}"], root)]
+            and run(["git", "rev-parse", "--verify", "-q", s], root)]
+    have = remote_has(urls, root) if urls else None
+    if have is not None:
+        return refs + (["--not", *have] if have else [])
+    # The remote could not be asked (the push itself will most likely fail the same way).
     # Tracking refs describe the FETCH repo. Only when every push URL is also a fetch URL do
     # they say what the push target already has.
     fetch = None if is_url else run(["git", "remote", "get-url", "--all", remote], root)
@@ -495,22 +1316,61 @@ class Scan:
                 return number
         return None
 
-    def lines(self, source, text, added_only=False):
+    def lines(self, source, text, skip=None):
         for n, line in enumerate(text.splitlines(), 1):
             if time.monotonic() > DEADLINE:
                 raise TimeoutError
-            if added_only and (not line.startswith("+") or line.startswith(DIFF_HEADERS)):
+            if skip and skip.match(line):
                 continue
             number = self.rule(line)
             if number:
                 self.hits.append((source, n, number))
 
+    def command_text(self, label, text, d):
+        """Text given on the command line. A $(...) in it runs before gh sees the text: `cat
+        FILE` or `< FILE` puts a file there (scanned), a heredoc's body is already in the text
+        (an unquoted one still runs its own $(...)), and any other command's output, stdin,
+        or a shell variable is unseen."""
+        self.lines(label, text)
+        for script in substitutions(text):
+            heredoc = HEREDOC.search(script)
+            if heredoc:
+                if not re.search(r"['\"\\]", heredoc.group(2)):
+                    self.command_text(label, script, d)
+                continue
+            files = re.fullmatch(r"\s*(?:cat\s|<)([^|;&<>()$`]*)", script)
+            if not files:
+                self.unseen.append(f"{label} is the output of a command the gate cannot run; "
+                                   "write the text out, or put it in a file")
+                continue
+            names = shlex.split(files.group(1))
+            paths = [f for f in names if not f.startswith("-")]
+            if "-" in names or not paths:
+                self.unseen.append(f"{label} is read from stdin")
+            for f in paths:
+                self.file(os.path.join(d, os.path.expanduser(f)), f)
+        outside = PLACEHOLDER.sub("", text)
+        for script in substitutions(text):
+            outside = outside.replace(f"$({script})", "").replace(f"`{script}`", "")
+        if re.search(r"\$[A-Za-z_{0-9@*#?!]", outside):
+            self.unseen.append(f"{label} is built from a shell variable; write the text out, "
+                               "or put it in a file")
+
+    def content(self, label, data, skip=None):
+        self.lines(label, data.decode("utf-8", "replace"), skip)
+        if not data.isascii():  # a legacy-encoded file: its non-ASCII terms only match here
+            self.lines(label, data.decode("latin-1"), skip)
+
+    def name(self, text):
+        number = self.rule(text)
+        if number:
+            self.hits.append(("(a file name)", 0, number))
+
     def shown(self, name):
         return "(a file name)" if self.rule(name) else name
 
     def file(self, path, label, in_repo=False):
-        if self.rule(label):
-            self.hits.append(("(a file name)", 0, self.rule(label)))
+        self.name(label)
         if in_repo and os.path.islink(path):
             self.lines(label, os.readlink(path))  # git publishes the link text, not the target
             return
@@ -525,37 +1385,115 @@ class Scan:
         except OSError:
             self.unscannable.append(label)
             return
-        self.lines(label, data.decode("utf-8", "replace"))
-        if not data.isascii():  # a legacy-encoded file: its non-ASCII terms only match here
-            self.lines(label, data.decode("latin-1"))
+        self.content(label, data)
 
-    def repo(self, root, include_ignored, history):
+    def objects(self, root, wanted, paths=None):
+        """Read git objects whole: wanted is [(object id, label)]. A blob is its full text, a
+        commit or tag everything but the author / committer / tagger header lines (identity),
+        a tree each name it holds, alone and under the tree's own path (paths: id -> path). Reading objects rather than a patch leaves no crafted line and
+        no merge for private text to hide behind. False when git could not read them all."""
+        wanted = list(dict.fromkeys(wanted))
+        if not wanted:
+            return True
+        found = git_bytes(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+                          root, "".join(f"{oid}\n" for oid, _ in wanted).encode())
+        found = found.decode("utf-8", "replace").splitlines() if found is not None else []
+        if len(found) != len(wanted):
+            return False
+        read, batch, size = [], [], 0
+        for (oid, label), line in zip(wanted, found):
+            parts = line.split()
+            if len(parts) != 3 or parts[0] != oid:
+                return False  # missing: git cannot vouch for what it would send
+            kind, length = parts[1], int(parts[2])
+            label = {"commit": "(commit messages)",
+                     "tag": "(branch and tag names, tag messages)"}.get(kind, label)
+            if kind == "blob" and length > MAX_FILE_BYTES:
+                self.unscannable.append(label)
+                continue
+            batch.append((oid, kind, label))
+            size += length
+            if size > BATCH_BYTES:
+                read.append(batch)
+                batch, size = [], 0
+        for batch in read + [batch]:
+            data = git_bytes(["cat-file", "--batch"], root,
+                             "".join(f"{oid}\n" for oid, _, _ in batch).encode())
+            if data is None:
+                return False
+            pos = 0
+            for oid, kind, label in batch:
+                header_end = data.index(b"\n", pos)
+                length = int(data[pos:header_end].split()[2])
+                body = data[header_end + 1:header_end + 1 + length]
+                pos = header_end + 2 + length
+                if kind == "tree":  # entries: <mode> <name>\0<raw object id>
+                    at, base = 0, (paths or {}).get(oid)
+                    while at < len(body):
+                        nul = body.index(b"\0", at)
+                        name = body[body.index(b" ", at) + 1:nul].decode("utf-8", "replace")
+                        self.name(name)
+                        if base:
+                            self.name(f"{base}/{name}")
+                        at = nul + 1 + len(oid) // 2
+                elif kind == "blob":
+                    self.content(label, body)
+                else:  # identity lines live in the header; the message is all content
+                    header, _, message = body.partition(b"\n\n")
+                    self.content(label, header, IDENTITY)
+                    self.content(label, message)
+        return True
+
+    def history(self, root, revs):
+        """Everything the revisions reach: every commit, tag, tree and blob, with the path each
+        was first found at."""
+        revs = [r for r in revs if r != "HEAD"
+                or run(["git", "rev-parse", "--verify", "-q", "HEAD"], root) is not None]
+        listing = git_bytes(["rev-list", "--objects", *revs], root)
+        if listing is None:
+            return False
+        wanted, paths = [], {}
+        for line in listing.decode("utf-8", "replace").splitlines():
+            oid, _, path = line.partition(" ")
+            paths[oid] = path
+            wanted.append((oid, f"(unpushed commits) {path}".rstrip()))
+        return self.objects(root, wanted, paths)
+
+    def staged(self, root):
+        """The index entries that differ from HEAD (all of them before the first commit)."""
+        raw = git_bytes(["diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev"], root)
+        if raw is None:
+            return False
+        fields = raw.decode("utf-8", "replace").split("\0")
+        wanted = []
+        for meta, path in zip(fields[0::2], fields[1::2]):
+            _, mode, _, oid = meta.split()[:4]
+            if mode != "160000" and set(oid) != {"0"}:  # a submodule commit; a deletion
+                wanted.append((oid, f"(staged changes) {path}"))
+        return self.objects(root, wanted)
+
+    def repo(self, root, worktree, include_ignored, history):
         key = (root, include_ignored, tuple(history))
         if key in self.done:
             return
         self.done.add(key)
-        listing_args = ["git", "ls-files", "-z", "--cached", "--others"]
-        if not include_ignored:
-            listing_args.append("--exclude-standard")
-        listing = run(listing_args, root)
-        staged = run(["git", "diff", "--cached", *DIFF_ARGS], root)
+        listing = ""
+        if worktree:
+            listing_args = ["git", "ls-files", "-z", "--cached", "--others"]
+            if not include_ignored:
+                listing_args.append("--exclude-standard")
+            raw = git_bytes(listing_args[1:], root)  # not run(): its strip() eats a leading space
+            listing = raw.decode("utf-8", "replace") if raw is not None else None
         ref_scope = [] if "--all" in history else ["refs/heads", "refs/tags"]
         refs = run(["git", "for-each-ref", "--format=%(refname:short)%0a%(contents)",
                     *ref_scope], root)
-        git_dir = run(["git", "rev-parse", "--git-common-dir"], root)
-        log = messages = ""
-        if run(["git", "rev-parse", "--verify", "-q", "HEAD"], root) is not None:
-            log = run(["git", "log", "-p", *DIFF_ARGS, "--format=",
-                       *history], root)
-            messages = run(["git", "log", "--format=%B", *history], root)
-        if None in (listing, staged, refs, git_dir, log, messages):
+        git_dir = git_path(["rev-parse", "--git-common-dir"], root)
+        if None in (listing, refs, git_dir) or not self.history(root, history) \
+                or (worktree and not self.staged(root)):
             self.unseen.append("could not list the files and commits that would ship")
             return
         for rel in sorted(set(filter(None, listing.split("\0")))):
             self.file(os.path.join(root, rel), rel, in_repo=True)
-        self.lines("(staged changes)", staged, added_only=True)
-        self.lines("(unpushed commits)", log, added_only=True)
-        self.lines("(commit messages)", messages)
         self.lines("(branch and tag names, tag messages)", refs)
         storage = run(["git", "config", "--get", "lfs.storage"], root)
         lfs = Path(root, git_dir, os.path.expanduser(storage or "lfs"), "objects")
@@ -567,8 +1505,12 @@ class Scan:
 def evaluate(parsed, scan):
     if parsed.redirected and any(k == "push" for k, _, _ in parsed.ops):
         scan.unseen.append("a push whose repository or remote is set by --git-dir, --work-tree, "
-                           "GIT_DIR / GIT_CONFIG*, or -c remote./url./branch./lfs.")
+                           "GIT_DIR / GIT_CONFIG*, or -c remote./url./branch./lfs./include.")
+    seen = set()  # both comment readings usually find the same publish; check it once
     for kind, dirs, args in parsed.ops:
+        if (kind, dirs, tuple(args)) in seen:
+            continue
+        seen.add((kind, dirs, tuple(args)))
         if kind == "unseen":
             scan.unseen.append(args[0])
             continue
@@ -581,21 +1523,29 @@ def evaluate(parsed, scan):
 
 
 def evaluate_one(kind, d, args, parsed, scan):
-    root = run(["git", "rev-parse", "--show-toplevel"], d)
+    root, worktree = locate(d)
     if kind == "push":
         if root is None:
             return  # git itself refuses to push outside a repository
-        value_flags = {"--repo", "-o", "--push-option", "--receive-pack", "--exec"}
-        named = flag_values(args, "--repo") + positionals(args, value_flags)
+        opts, words = push_args(args)
+        named = words[:1] or [o[7:] for o in opts if o.startswith("--repo=")][-1:]
         if not named and run(["git", "remote"], root) == "" \
                 and push_remote(root) == "origin":
             return  # no remote and no configured destination: git refuses the push
-        remote = named[0] if named else push_remote(root)
-        refspecs = positionals(args, value_flags)[1:] + (["--mirror"] if "--mirror" in args
-                                                          else [])
+        remote = named[0] if named else push_remote(root)  # a positional beats --repo
+        recurse = submodule_push(opts, root)
+        if recurse and worktree:  # each submodule is pushed to its own remote
+            for path in gitlinks(root):  # each is itself pushed, with its own submodules
+                evaluate_one("push", os.path.join(root, path),
+                             ["--recurse-submodules=on-demand"], parsed, scan)
+            if recurse == "only":
+                return  # the superproject itself is not pushed
+        # send-pack --stdin reads its refs from stdin, unseen here: count every ref as sent
+        refspecs = words[1:] + (["--mirror"] if "--mirror" in opts or "--stdin" in opts
+                                else [])
         outgoing = outgoing_range(root, remote, refspecs)
         if outgoing is not None:
-            scan.repo(root, parsed.force_add, outgoing)
+            scan.repo(root, worktree, parsed.force_add, outgoing)
 
     elif kind == "repo-create":
         if "--public" not in args:
@@ -604,17 +1554,17 @@ def evaluate_one(kind, d, args, parsed, scan):
                        "-t", "--template", "-p", "--remote", "-r", "--gitignore", "-g",
                        "--license", "-l"}
         for text in positionals(args, value_flags) + flag_values(args, "--description", "-d"):
-            scan.lines("(the repository name or description)", text)
+            scan.command_text("(the repository name or description)", text, d)
         for template in flag_values(args, "--template", "-p"):
             if visibility(template, d) != "PUBLIC":  # its files become this repo's files
                 scan.unseen.append("a public repository created from a template that is "
                                    "not public")
         for source in flag_values(args, "--source", "-s"):
-            src_root = run(["git", "rev-parse", "--show-toplevel"], os.path.join(d, source))
+            src_root, src_worktree = locate(os.path.join(d, source))
             if src_root is None:
                 scan.unseen.append("could not resolve the --source repository")
             else:
-                scan.repo(src_root, parsed.force_add, ["--all"])
+                scan.repo(src_root, src_worktree, parsed.force_add, ["--all"])
 
     elif kind == "make-public":
         named = flag_values(args, "--repo", "-R") + positionals(
@@ -627,19 +1577,33 @@ def evaluate_one(kind, d, args, parsed, scan):
         elif root is None:
             scan.unseen.append("could not resolve the repository being made public")
         else:
-            scan.repo(root, parsed.force_add, ["--all"])
+            scan.repo(root, worktree, parsed.force_add, ["--all"])
 
     elif kind == "gist":
         if not ({"--public", "-p"} & set(args)):
             return
         for text in flag_values(args, "--desc", "-d"):
-            scan.lines("(the gist description)", text)
+            scan.command_text("(the gist description)", text, d)
         files = positionals(args, {"--desc", "-d", "--filename", "-f"})
         if not files or "-" in files:
             scan.unseen.append("a public gist read from stdin")
         for f in files:
             if f != "-":
                 scan.file(os.path.join(d, os.path.expanduser(f)), f)
+
+    elif kind == "label-clone":  # labels copied in from another repository
+        source = (positionals(args, {"--repo", "-R"}) or [None])[0]
+        repo = (flag_values(args, "--repo", "-R") or [None])[0]
+        if source and is_public(repo, d) and visibility(source, d) != "PUBLIC":
+            scan.unseen.append("labels copied from a repository that is not public")
+
+    elif kind == "gist-edit":  # an existing gist, whose visibility is not looked up
+        for text in flag_values(args, "--desc", "-d"):
+            scan.command_text("(the gist description)", text, d)
+        files = positionals(args, {"--add", "-a", "--desc", "-d", "--filename", "-f", "--remove",
+                                   "-r"})[1:] + flag_values(args, "--add", "-a")
+        for f in files:
+            scan.file(os.path.join(d, os.path.expanduser(f)), f)
 
     elif kind.startswith("release-"):
         repo = (flag_values(args, "--repo", "-R") or [None])[0]
@@ -648,7 +1612,7 @@ def evaluate_one(kind, d, args, parsed, scan):
         value_flags = {"--notes", "-n", "--title", "-t", "--notes-file", "-F", "--target",
                        "--discussion-category", "--repo", "-R", "--notes-start-tag", "--tag"}
         for text in flag_values(args, "--notes", "-n", "--title", "-t"):
-            scan.lines("(the release notes or title)", text)
+            scan.command_text("(the release notes or title)", text, d)
         for f in flag_values(args, "--notes-file", "-F"):
             if f == "-":
                 scan.unseen.append("release notes read from stdin")
@@ -657,20 +1621,22 @@ def evaluate_one(kind, d, args, parsed, scan):
         if kind != "release-edit":
             for asset in positionals(args, value_flags)[1:]:
                 path, _, label = asset.partition("#")
-                scan.lines("(an asset label)", label)
+                scan.command_text("(an asset label)", label, d)
                 scan.file(os.path.join(d, os.path.expanduser(path)), path)
         if kind == "release-create" and root and repo is None:
             outgoing = outgoing_range(root, push_remote(root))
             if outgoing is not None:
-                scan.repo(root, parsed.force_add, outgoing)
+                scan.repo(root, worktree, parsed.force_add, outgoing)
 
-    elif kind == "text":
+    elif kind in ("text", "text-anywhere"):  # text-anywhere: its visibility is not looked up
+        texts = flag_values(args, "--body", "-b", "--title", "-t", "--subject", "--comment", "-c")
+        files = flag_values(args, "--body-file", "-F")
         repo = (flag_values(args, "--repo", "-R") or [None])[0]
-        if not is_public(repo, d):
+        if not (texts or files) or kind == "text" and not is_public(repo, d):
             return
-        for text in flag_values(args, "--body", "-b", "--title", "-t"):
-            scan.lines("(the issue or PR text)", text)
-        for f in flag_values(args, "--body-file", "-F"):
+        for text in texts:
+            scan.command_text("(the issue, PR or repository text)", text, d)
+        for f in files:
             if f == "-":
                 scan.unseen.append("an issue or PR body read from stdin")
             else:
@@ -707,7 +1673,7 @@ def evaluate_one(kind, d, args, parsed, scan):
             if value.startswith("@"):
                 scan.file(os.path.join(d, os.path.expanduser(value[1:])), value[1:])
             else:
-                scan.lines("(an API field)", value)
+                scan.command_text("(an API field)", value, d)
         for f in inputs:
             scan.file(os.path.join(d, os.path.expanduser(f)), f)
 
@@ -732,7 +1698,13 @@ def block(reason):
 
 def gate(command, cwd):
     parsed = Parsed()
-    walk(tokenize(command), (os.path.normpath(cwd),), parsed)
+    # Whether # starts a comment depends on the shell (zsh needs interactivecomments), so both
+    # readings are walked and every publish either one finds is checked.
+    inherited = parsed.gh_env
+    for comments in (False, True):
+        parsed.pushd, parsed.gh_env = [], inherited  # each reading starts from the shell's own
+        parsed.gh_aliases, parsed.gh_alias_opaque = {}, False
+        walk(tokenize(command, comments), (os.path.normpath(cwd),), parsed)
     if not parsed.ops:
         return 0
     try:
@@ -758,6 +1730,10 @@ def gate(command, cwd):
         out.append(f"  {scan.shown(source)}:{n}  (term file line {number})")
     if len(hits) > 40:
         out.append(f"  ... and {len(hits) - 40} more")
+    if UNFETCHED:
+        out += ["", "The remote has commits this clone has not fetched, so all history not "
+                    "provably on it was scanned. If these matches are already public there, "
+                    "`git fetch` and retry."]
     out += ["", "Do not add an exclusion. Remove the content (from any unpushed commit too), "
                 "or move it out of the repo and add its path to .gitignore, then retry."]
     print("\n".join(out), file=sys.stderr)
@@ -778,7 +1754,7 @@ def main():
     if not isinstance(tool, str) or not isinstance(command, str):
         # Never block on our own confusion -- unless the text could be a publish.
         return block("hook payload was malformed") if MAYBE_PUBLISH.search(raw) else 0
-    if not MAYBE_PUBLISH.search(command):
+    if not MAYBE_PUBLISH.search(re.sub(r"\\\n|[\\'\"]", "", command)):  # g'i't, gi\<newline>t
         return 0
     try:
         return gate(command, payload.get("cwd") or os.getcwd())

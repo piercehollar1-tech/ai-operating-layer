@@ -154,7 +154,7 @@ This boundary is why the adapters stay thin. They translate durable conventions;
 Once the file layer is stable, these subsystems change what it is capable of. They are ordered by how much they repay the effort:
 
 1. **A control layer.** Rules whose violation is expensive belong in hooks rather than documents. This is the highest-value addition and the hardest to retrofit, because nothing looks broken while it is missing. → [enforcement](enforcement.md)
-2. **Verification as a control.** An evidence gate on claims, a citation gate at stop, probe suites for every gate run by a hook after every hook edit. → [verification](verification.md)
+2. **Verification as a control.** An evidence gate on claims, a citation gate at stop, probe suites for every gate, the affected ones run by a hook after every hook edit. → [verification](verification.md)
 3. **Context delivery.** Per-skill operational memory and routing pointers injected at the tool call, with evidence-based promotion and pruning of lessons. → [context delivery](context-delivery.md)
 4. **Scheduled autonomous work and session continuity.** Recurring jobs that do not need a session, plus summaries and a decisions queue so work survives the end of one. → [automation](automation.md)
 5. **A self-improvement loop.** New knowledge routed to exactly one home at write time, behind a write bar, so the layer improves instead of accumulating. → [automation](automation.md)

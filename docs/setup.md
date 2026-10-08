@@ -106,8 +106,9 @@ Only after the controls above are proven:
 - the delegation gate, with the dispatch-contract and delegate-first hooks
   ([delegation](delegation.md)), and a task-packet template
   ([example](../reference/agents/task-packet.md.example));
-- probe suites for every blocking gate, run by a Stop hook after any hook edit, with an audit
-  check that every hook and checker has one and that the suites ran recently
+- probe suites for every blocking gate, the affected ones run by a Stop hook after any hook
+  edit (all of them when the edited file has no suite), with an audit check that every hook and
+  checker has one or declares it has none, and that the suites ran recently
   ([verification](verification.md); a runnable example is in
   [`reference/hooks/tests/`](../reference/hooks/tests/pre-publish-scan-probes.py.example)).
 

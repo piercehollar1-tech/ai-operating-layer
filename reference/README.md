@@ -49,7 +49,8 @@ when the context beneath them is shared. See [../docs/enforcement.md](../docs/en
 
 `hooks/tests/` holds a probe suite for the example publication hook: a `# covers:` line, quiet
 cases, the inputs the hook exists to catch, and mutations that must each turn a case red. Unlike
-the rest of this directory it is runnable, and CI runs it. See
+the rest of this directory it is runnable: CI runs the cases, and `--mutations` runs the
+mutations after a change to the hook. See
 [../docs/verification.md](../docs/verification.md).
 
 `agents/task-packet.md.example` is a filled-in packet for a delegated worker; the worker

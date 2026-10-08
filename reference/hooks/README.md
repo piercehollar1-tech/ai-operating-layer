@@ -11,7 +11,7 @@ Nothing here is wired up, except that CI runs the probe suite against the exampl
 | `pre-publish-scan.py.example` | Blocking a publish to a public destination when it would carry private data. The agent-side layer: parses the command rather than grepping it; checks every push URL each publish really uses; scans file names and contents, the staged index, unpushed commits, commit messages, ref names, notes, symlink targets, and LFS objects; fails closed, including on its own crash; has no exclude list; never echoes the match. Its docstring lists what it cannot see, which is why a git `pre-push` hook is the second layer. |
 | `private-terms.txt.example` | The shape of a term file — and why it must live outside any published tree. |
 | `routes.json.example` | A routing table for a pre-tool nudge: fires the adapter's routing pointers at the tool call, as added context only. |
-| `tests/pre-publish-scan-probes.py.example` | The publication hook's probe suite. Runnable (CI runs it): throwaway repositories built once, a stub `gh` on `PATH`, a redirected home directory, quiet cases written the way real commands look, and mutations that must each be caught, run four at a time. |
+| `tests/pre-publish-scan-probes.py.example` | The publication hook's probe suite. Runnable (CI runs the cases): throwaway repositories built once, a stub `gh` on `PATH`, a redirected home directory, quiet cases written the way real commands look, and mutations that must each be caught, run four at a time with `--mutations`. |
 
 ## Lifecycle map
 
@@ -42,7 +42,7 @@ Hook point names vary by client. These categories do not. A layer that only logs
 
 **Say it through the channel each party can see.** A permission prompt's reason reaches the user, not the model. An instruction to the model belongs in the added-context field; a fact for the user belongs in the reason. Say it twice when both need it.
 
-**Give every gate a probe suite with a `# covers:` line, and run all suites from a Stop hook after any edit under the hooks directory.** Coverage declared, not inferred; a stale declaration reads as uncovered. See [../../docs/verification.md](../../docs/verification.md).
+**Give every gate a probe suite with a `# covers:` line, and have a Stop hook run the suites an edit under the hooks directory affects — all of them when the edited file is one no suite declares.** Coverage declared, not inferred; a stale declaration reads as uncovered. A hook that only informs may declare `# suite: none` in its own head instead. See [../../docs/verification.md](../../docs/verification.md).
 
 **Probe with the home directory redirected.** A hook run by hand really writes to its logs and state. One writer per event; re-run the whole case list after each fix.
 

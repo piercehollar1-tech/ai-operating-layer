@@ -18,13 +18,17 @@ Four rules it demonstrates:
     below edits a copy of the hook; at least one case must then fail. A
     mutation no case notices is a SURVIVOR (a real gap, or an equivalent mutant
     to retire with the reason written down). A mutation whose target text no
-    longer exists is STALE: the hook changed and the suite did not.
+    longer exists is STALE: the hook changed and the suite did not. One that
+    does not compile is BROKEN: its crash would turn every case red and prove
+    nothing. Running every mutation takes far longer than the cases, so it is
+    opt-in (--mutations): run it after changing the hook. A plain run still
+    reports a STALE or BROKEN mutation, so the list cannot rot unseen.
 
   * A green suite is not a finished one. An earlier version passed with every
     mutation caught, and the next outside review still found a dozen more ways
-    past the gate. Each finding from four review rounds is now a case here.
+    past the gate. Each finding from thirteen review rounds is now a case here.
 
-Run: python3 reference/hooks/tests/pre-publish-scan-probes.py.example
+Run: python3 reference/hooks/tests/pre-publish-scan-probes.py.example [--mutations]
 """
 
 from __future__ import annotations
@@ -49,11 +53,14 @@ PRIVATE_URL = "https://github.com/example/private-repo.git"
 PUBLIC_URL = "https://github.com/example/public-repo.git"
 
 GH_STUB = """#!/bin/sh
+case " $* " in *" --help "*) [ -z "$GH_NO_HELP" ] || exit 1 ;; esac
+case " $* " in *" --help "*|" alias list ") PATH="${PATH#*:}" exec gh "$@" ;; esac
 case "$*" in *"--jq .nameWithOwner"*)
   [ "$GH_MODE" = FAIL ] && exit 1; echo example/this-repo; exit 0 ;; esac
 case "$GH_MODE" in
   PUBLIC|PRIVATE) echo "$GH_MODE" ;;
   BYURL) case "$3" in *public*) echo PUBLIC ;; *private*) echo PRIVATE ;; *) exit 1 ;; esac ;;
+  HEREPRIVATE) case "$3" in *public*) echo PUBLIC ;; *) echo PRIVATE ;; esac ;;
   *) exit 1 ;;
 esac
 """
@@ -162,9 +169,117 @@ def build(base: Path) -> None:
     r = repo(untracked={"secret.txt": LEAK}, ignored=["secret.txt"])
     case("a force-added ignored file", "git add -f secret.txt && git push", r, 2)
     case("  (git add --force)", "git add --force secret.txt && git push", r, 2)
+    case("  (git add --forc: an abbreviated --force)", "git add --forc secret.txt && git push", r,
+         2)
     r = repo()
     git(r, "commit", "-q", "--allow-empty", "-m", "notes for the client-portal rollout")
     case("a private commit message", "git push", r, 2, expect_in="(commit messages)")
+    super_r = repo()
+    submod = Path(super_r) / "vendor"
+    submod.mkdir()
+    git(submod, "init", "-q", "-b", "main")
+    git(submod, "remote", "add", "origin", PUBLIC_URL)
+    (submod / "notes.md").write_text(LEAK)
+    git(submod, "add", "-A")
+    git(submod, "commit", "-qm", "init")
+    git(super_r, "add", "vendor")
+    git(super_r, "commit", "-qm", "add submodule")
+    case("a recursive push publishes a submodule's commits (--recurse-submodules=on-demand)",
+         "git push --recurse-submodules=on-demand origin main", super_r, 2, gh="BYURL")
+    case("  (git -c push.recurseSubmodules=on-demand)",
+         "git -c push.recurseSubmodules=on-demand push origin main", super_r, 2, gh="BYURL")
+    case("  (=only pushes the submodules alone)", "git push --recurse-submodules=only origin main",
+         super_r, 2, gh="BYURL")
+    super_cfg = repo()
+    submod2 = Path(super_cfg) / "vendor"
+    submod2.mkdir()
+    git(submod2, "init", "-q", "-b", "main")
+    git(submod2, "remote", "add", "origin", PUBLIC_URL)
+    (submod2 / "notes.md").write_text(LEAK)
+    git(submod2, "add", "-A")
+    git(submod2, "commit", "-qm", "init")
+    git(super_cfg, "add", "vendor")
+    git(super_cfg, "commit", "-qm", "add submodule")
+    git(super_cfg, "config", "push.recurseSubmodules", "on-demand")
+    case("  (push.recurseSubmodules=on-demand in the repository's config)", "git push origin main",
+         super_cfg, 2, gh="BYURL")
+    rewound = base / "repos" / "rewound-remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(rewound)], capture_output=True)
+    r = repo()
+    git(r, "remote", "set-url", "origin", str(rewound))
+    git(r, "push", "-q", "origin", "main")
+    first = git(r, "rev-parse", "HEAD").stdout.strip()
+    (Path(r) / "draft.md").write_text(LEAK)
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "draft")
+    git(r, "rm", "-q", "draft.md")
+    git(r, "commit", "-qm", "remove draft")
+    git(r, "push", "-q", "origin", "main")
+    git(rewound, "update-ref", "refs/heads/main", first)  # rewound elsewhere; not fetched here
+    case("a rewound remote: stale tracking refs do not say what it has (git ls-remote does)",
+         "git push origin main", r, 2, expect_in="(unpushed commits)")
+    r = repo(untracked={" secret.txt": LEAK})
+    case("a file name that starts with a space", "git push origin main", r, 2)
+    clean_twin = repo()
+    leaky_twin = Path(str(clean_twin) + " ")
+    os.rename(repo({"a.md": LEAK}), leaky_twin)
+    case("a repository folder whose name ends in a space is not mistaken for its neighbour",
+         f"git push {PUBLIC_URL} main", leaky_twin, 2)
+    case("GH_REPO sends gh to another repository",
+         "GH_REPO=example/private-repo gh repo edit --visibility public", clean, 2,
+         expect_in="GH_REPO")
+    case("  (export GH_REPO, then gh)", "export GH_REPO=example/other && gh issue create -t x -b y",
+         clean, 2, expect_in="GH_REPO")
+    case("  (env GH_HOST=... gh)", "env GH_HOST=ghe.example.com gh issue create -t x -b y", clean,
+         2, expect_in="GH_HOST")
+    case("  (inherited from the environment)", "gh issue create -t x -b y", clean, 2,
+         expect_in="GH_REPO", env={"GH_REPO": "example/other"})
+    case("  QUIET: GH_REPO with a read", "GH_REPO=example/other gh issue list", clean, 0)
+    case("  QUIET: GH_REPO with the repository named by --repo",
+         "GH_REPO=example/other gh issue create -R example/public-repo -t x -b y", clean, 0)
+    case("  QUIET: GH_HOST=github.com is the default host",
+         "GH_HOST=github.com gh issue create -t x -b y", clean, 0)
+    case("  QUIET: GH_REPO set only for a LATER gh",
+         "gh issue create -t x -b y; GH_REPO=example/other gh issue list", clean, 0)
+    case("a glued short option value (gh api -fbody=...)",
+         'gh api repos/example/public-repo/issues -fbody="seen in Exampleville"', clean, 2)
+    case("  (gh issue create -b'...')", "gh issue create -tx -b'seen in Exampleville'", clean, 2)
+    super_only = repo({"a.md": LEAK}, origin=PUBLIC_URL)
+    submod3 = Path(super_only) / "vendor"
+    submod3.mkdir()
+    git(submod3, "init", "-q", "-b", "main")
+    git(submod3, "remote", "add", "origin", PUBLIC_URL)
+    (submod3 / "notes.md").write_text(CLEAN)
+    git(submod3, "add", "-A")
+    git(submod3, "commit", "-qm", "init")
+    git(super_only, "add", "vendor")
+    git(super_only, "commit", "-qm", "add submodule")
+    case("--recurse-submodules=on-demand still pushes the superproject",
+         "git push --recurse-submodules=on-demand origin main", super_only, 2, gh="BYURL")
+    case("the LAST --recurse-submodules wins (only, then on-demand: the superproject is pushed)",
+         "git push --recurse-submodules=only --recurse-submodules=on-demand origin main",
+         super_only, 2, gh="BYURL")
+    case("  (the command's own flag beats git -c push.recurseSubmodules=only)",
+         "git -c push.recurseSubmodules=only push --recurse-submodules=on-demand origin main",
+         super_only, 2, gh="BYURL")
+    case("  QUIET: on-demand, then only: the superproject is not pushed",
+         "git push --recurse-submodules=on-demand --recurse-submodules=only origin main",
+         super_only, 0, gh="BYURL")
+    case("--no-recurse-submodules then --recurse-submodules=on-demand pushes the submodules",
+         "git push --no-recurse-submodules --recurse-submodules=on-demand origin main", super_r,
+         2, gh="BYURL")
+    case("  QUIET: on-demand, then --no-recurse-sub (git takes a unique prefix)",
+         "git push --recurse-submodules=on-demand --no-recurse-sub origin main", super_r, 0,
+         gh="BYURL")
+    case("an abbreviated option: git push --recurse-sub=on-demand",
+         "git push --recurse-sub=on-demand origin main", super_r, 2, gh="BYURL")
+    case("  (the value in the next word: --recurse-submodules on-demand)",
+         "git push --recurse-submodules on-demand origin main", super_r, 2, gh="BYURL")
+    r = repo()
+    git(r, "commit", "-q", "--allow-empty", "-m", "ordinary", "-m", "author notes from Exampleville")
+    git(r, "commit", "-q", "--allow-empty", "-m", "later")  # not the tip: the ref listing misses it
+    case("a message line that starts with 'author ' is message, not identity", "git push", r, 2,
+         expect_in="(commit messages)")
     r = repo()
     git(r, "branch", "exampleville-demo")
     case("a private branch name", "git push --all origin", r, 2)
@@ -174,6 +289,9 @@ def build(base: Path) -> None:
     r = pushed(repo())
     git(r, "notes", "add", "-m", "client-portal follow-up", "HEAD")
     case("--mirror publishes notes too", "git push --mirror origin", r, 2)
+    case("  (git push --mirr: an abbreviated --mirror)", "git push --mirr origin", r, 2)
+    case("git send-pack --stdin reads its refs from stdin: all of them count",
+         "echo refs/notes/commits | git send-pack --stdin {PUBLIC_URL}", r, 2)
     case("  (an explicit refs/notes refspec)", "git push origin refs/notes/commits", r, 2)
     case("  QUIET: a normal push does not send notes", "git push origin main", r, 0)
     r = pushed(repo())
@@ -294,6 +412,10 @@ def build(base: Path) -> None:
     case("VAR=x git push", "GIT_TRACE=0 git push", dirty, 2)
     case("env NAME=value git push", "env DEPLOY=1 git push origin main", dirty, 2)
     case("xargs git push", "echo origin | xargs git push", dirty, 2)
+    case("find with a program name before -exec (find -name cd -exec git push)",
+         "find . -name cd -exec git push origin main \\;", dirty, 2)
+    case("  (script's log file named sh: script -q sh git push)", "script -q sh git push origin main",
+         dirty, 2)
     case("a failed cd leaves the shell where it was", "cd /no/such/dir; git push", dirty, 2)
     r = repo({"a.md": LEAK})
     git(r, "config", "alias.shipit", "push --follow-tags")
@@ -354,6 +476,69 @@ def build(base: Path) -> None:
     r = repo(untracked={"notes.md": LEAK})
     case("gh gist create --public <leaky file>", "gh gist create --public notes.md", r, 2)
     case("gh gist create -p <leaky file>", "gh gist create -p notes.md", r, 2)
+    case("  (gh's help unreadable, so -p is read as written)", "gh gist create -p notes.md", r, 2,
+         env={"GH_NO_HELP": "1"})
+    case("  QUIET: (help unreadable) a secret gist", "gh gist create notes.md", r, 0,
+         env={"GH_NO_HELP": "1"})
+    case("gh short flags bundled: gh gist create -pw", "gh gist create -pw notes.md", r, 2)
+    case("  (a bool given a value: --public=true)", "gh gist create --public=true notes.md", r,
+         2)
+    case("  QUIET: --public=false is a secret gist", "gh gist create --public=false notes.md", r,
+         0)
+    case("  (-pd: public, and the description in the next word)",
+         'gh gist create -pd "internal-dashboard notes" README.md', clean, 2)
+    case("gh repo create --public=true", "gh repo create example/x --public=true --source=. --push",
+         dirty, 2)
+    case("gh repo edit --visibility PUBLIC (gh takes any case)",
+         "gh repo edit --visibility PUBLIC --accept-visibility-change-consequences", dirty, 2)
+    case("a group flag before the subcommand: gh issue -R <public> create",
+         'gh issue -R example/public-repo create -t x -b "seen in Exampleville"', clean, 2,
+         gh="HEREPRIVATE")
+    case("  QUIET: gh issue -R <private> create", 'gh issue -R example/private-repo create -t x -b '
+         '"seen in Exampleville"', clean, 0, gh="HEREPRIVATE")
+    case("gh discussion create", 'gh discussion create -t x -b "seen in Exampleville"', clean,
+         2)
+    case("gh label create (the name is public)", "gh label create internal-dashboard -d x", clean, 2)
+    case("  (gh label edit --name)", "gh label edit bug --name internal-dashboard", clean, 2)
+    case("gh label clone from a private repository",
+         "gh label clone example/private-repo -R example/public-repo", clean, 2, gh="BYURL")
+    case("  QUIET: gh label clone from a public repository",
+         "gh label clone example/public-repo -R example/public-repo", clean, 0, gh="BYURL")
+    case("gh repo rename (the new name)", "gh repo rename internal-dashboard-tools", clean, 2)
+    case("gh repo edit --add-topic", "gh repo edit --add-topic internal-dashboard", clean, 2)
+    case("gh repo fork --fork-name", "gh repo fork example/public-repo --fork-name internal-dashboard-fork",
+         clean, 2, gh="BYURL")
+    case("gh gist rename (an existing gist: its visibility is not looked up)",
+         "gh gist rename 0123abcd a.md Exampleville.md", clean, 2, gh="PRIVATE")
+    case("gh project item-create (a project's visibility is not looked up)",
+         'gh project item-create 1 --owner @me --title "internal-dashboard rollout"', clean, 2,
+         gh="PRIVATE")
+    case("  (gh project edit --visibility PUBLIC: its items are not scanned)",
+         "gh project edit 1 --owner @me --visibility PUBLIC", clean, 2)
+    case("gh agent-task create (the task and its pull request)",
+         'gh agent-task create "draft the internal-dashboard rollout"', clean, 2)
+    case("gh workflow run -f (a run's inputs)", 'gh workflow run d.yml -f note="internal-dashboard"', clean,
+         2)
+    case("gh skill publish releases this repository's skills", "gh skill publish", dirty, 2)
+    case("  QUIET: gh skill publish --dry-run", "gh skill publish --dry-run", dirty, 0)
+    case("a gh alias set in the same command",
+         "gh alias set pv 'repo edit --visibility public' && gh pv", dirty, 2)
+    case("  (a shell alias: gh alias set --shell)",
+         """gh alias set --shell ip 'gh issue create -t x -b "seen in Exampleville"' && gh ip""",
+         clean, 2)
+    (base / "home" / ".config" / "gh").mkdir(parents=True, exist_ok=True)
+    (base / "home" / ".config" / "gh" / "config.yml").write_text(
+        "aliases:\n    pubit: repo edit --visibility public\n    co: pr checkout\n")
+    case("  (an alias from gh's config)", "gh pubit", dirty, 2)
+    case("  (GH_CONFIG_DIR: aliases from a config this gate does not read)",
+         "GH_CONFIG_DIR=/tmp/elsewhere gh pubit2", dirty, 2)
+    case("  (gh alias import, then an alias)", "gh alias import a.yml && gh pubit3", dirty, 2)
+    case("export GIT_DIR sends a later push from another repository",
+         "export GIT_DIR=/tmp/elsewhere/.git && git push origin main", clean, 2)
+    case("  (declare -x GIT_WORK_TREE)", "declare -x GIT_WORK_TREE=/tmp/o; git push origin main",
+         clean, 2)
+    case("  QUIET: gh co (an alias for a read), gh auth status, an extension",
+         "gh co 5; gh auth status; gh some-extension run", dirty, 0)
     case("a public gist from stdin", "echo hi | gh gist create --public -", clean, 2)
     case("a public gist of a missing file", "gh gist create --public nowhere.md", clean, 2)
     case("a public gist with a private description",
@@ -388,8 +573,513 @@ def build(base: Path) -> None:
     case("gh api posting private text",
          "gh api repos/example/x/issues -f title=hi -f body=client-portal", clean, 2)
 
+    # --- must block: the 2026-09-26 read-only audit's bypasses (F1-F6), all reproduced while
+    # this suite was green, plus the neighbouring shapes found while fixing them
+    case("F1 a cd inside an if that never runs",
+         f"if false; then cd {clean}; fi; git push origin main", dirty, 2)
+    case("F1 a cd after && that may not run", f"false && cd {clean}; git push origin main",
+         dirty, 2)
+    case("F1 a cd inside a loop body", f"while false; do cd {clean}; done; git push origin main",
+         dirty, 2)
+    case("F1 a cd inside a function that is never called",
+         f"f() {{ cd {clean}; }}; git push origin main", dirty, 2)
+    case("F1 a cd in a pipeline (a subshell in bash)", f"cd {clean} | cat; git push origin main",
+         dirty, 2)
+    case("F1 a cd at the end of a pipeline (zsh keeps it)",
+         f"true | cd {clean}; git push origin main", dirty, 2)
+    case("F1 a cd sent to the background", f"cd {clean} & git push origin main", dirty, 2)
+    case("F1 a cd after || that never runs", f"true || cd {clean}; git push origin main", dirty,
+         2)
+    case("F1 a push after || runs where the && chain stopped",
+         f"false && cd {clean} || git push origin main", dirty, 2)
+    case("F1 a cd run by eval stays in the shell", f'eval "cd {dirty}"; git push origin main',
+         clean, 2)
+    case("F1 failed cds do not crowd out the real directory",
+         "cd /no/a; cd /no/b; cd /no/c; cd /no/d; cd /no/e; git push origin main", dirty, 2)
+    case("F1 a cd to a directory-stack entry", "cd +1 && git push origin main", clean, 2,
+         expect_in="could not resolve")
+    case("F1 zsh's two-argument cd rewrites the path",
+         f"cd {clean.name} {dirty.name} && git push origin main", clean, 2)
+    case("F1 a bare pushd swaps back", f"pushd {clean} && pushd; git push origin main", dirty, 2)
+    locked = base / "locked-dir"
+    locked.mkdir()
+    locked.chmod(0)
+    case("F1 a cd into a directory it cannot enter fails", f"cd {locked}; git push origin main",
+         dirty, 2)
+    case("F1 zsh autocd: a bare directory path is a cd", f"{dirty}\ngit push origin main",
+         clean, 2)
+    case("F1 a bare directory name in bash is not a cd", f"{clean}\ngit push origin main",
+         dirty, 2)
+    case("F1 text after # is a comment the shell never runs",
+         f"true # ; cd {clean}\ngit push origin main", dirty, 2)
+    case("a # that a shell without comments runs past", "echo hi # ; git push origin main",
+         dirty, 2)
+    case("F1 env cd runs an external cd", f"env cd {clean}; git push origin main", dirty, 2)
+    case("F1 timeout N cd runs an external cd", f"timeout 5 cd {clean}; git push origin main",
+         dirty, 2)
+    case("F1 coproc runs its cd in a subshell", f"coproc cd {clean}; git push origin main",
+         dirty, 2)
+    case("a push run by coproc", "coproc git push origin main", dirty, 2)
+    case("a quoted '<<EOF' starts no heredoc", "echo '<<EOF'\ngit push origin main\nEOF",
+         dirty, 2)
+    case("  (double-quoted too)", 'echo "<<EOF"\ngit push origin main\nEOF', dirty, 2)
+    case("  (nor does one inside a comment)", "echo hi # <<EOF\ngit push origin main\nEOF",
+         dirty, 2)
+    case("a wrapper option that takes a value (env -u NAME)",
+         "env -u GIT_CONFIG_GLOBAL git push origin main", dirty, 2)
+    case("  (nice -n 5)", "nice -n 5 git push origin main", dirty, 2)
+    case("  (timeout -s KILL 60)", "timeout -s KILL 60 git push origin main", dirty, 2)
+    case("  (an option unknown to the gate, then git)", "nice -Z 5 git push origin main",
+         dirty, 2)
+    case("timeout N bash -c (the duration is not the command)",
+         "timeout 5 bash -c 'git push origin main'", dirty, 2)
+    case("  (an unknown option, then a shell)", "nice -Z 5 bash -c 'git push origin main'",
+         dirty, 2)
+    case("env -C <dir> runs the push in <dir>", f"env -C {dirty} git push origin main", clean, 2)
+    case("env -S splits a string into the command", "env -S 'git push origin main'", dirty, 2)
+    case("a wrapper named by its full path (/usr/bin/env -C)",
+         f"/usr/bin/env -C {dirty} git push origin main", notrepo, 2)
+    case("zsh's noglob runs the command after it", "noglob git push origin main", dirty, 2)
+    case("  (inside zsh -c)", "zsh -fc 'noglob git push origin main'", dirty, 2)
+    case("  (nocorrect)", "nocorrect git push origin main", dirty, 2)
+    case("  (zsh's - modifier)", "- git push origin main", dirty, 2)
+    case("  (noglob cd moves the shell)", f"noglob cd {dirty}; git push origin main", notrepo, 2)
+    case("a program the gate has no list entry for runs git (arch)",
+         "arch -arm64 git push origin main", dirty, 2)
+    case("  (stdbuf)", "stdbuf -o0 git push origin main", dirty, 2)
+    case("  (script)", "script -q /dev/null git push origin main", dirty, 2)
+    case("  (taskpolicy, then a shell)", "taskpolicy -b zsh -c 'git push origin main'", dirty, 2)
+    case("an unquoted dash delimiter still runs the body's $(...)",
+         "cat <<END-OF-DATA\n$(git push origin main)\nEND-OF-DATA", dirty, 2)
+    case("  (and a body fed to a shell still runs)",
+         "bash <<'END-OF-DATA'\ngit push origin main\nEND-OF-DATA", dirty, 2)
+    case("a program given the push as one quoted word (watch)",
+         "watch -n 1 'git push origin main'", dirty, 2)
+    case("  (script -c)", "script -q -c 'git push origin main' /dev/null", dirty, 2)
+    case("  (flock -c)", "flock /tmp/l -c 'git push origin main'", dirty, 2)
+    case("  (man -P runs a pager command)", "man -P 'git push origin main' ls", dirty, 2)
+    case("  (the push later in the quoted script: script -c 'echo; git push')",
+         "script -q -c 'echo status; git push origin main' /dev/null", dirty, 2)
+    case("  (flock -c 'true && git push')", "flock /tmp/l -c 'true && git push origin main'", dirty,
+         2)
+    case("a $ in a heredoc delimiter: a body fed to a shell still runs",
+         "bash <<EOF$x\ngit push origin main\nEOF$x", dirty, 2)
+    case("ripgrep --pre runs git with the searched path (rg --pre=git . push)",
+         "rg --pre=git . push", dirty, 2)
+    case("  (the value as its own word)", "rg --pre git . push", dirty, 2)
+    case("a backslash-newline joins the lines (git \\ push)", "git \\\n  push origin main", dirty,
+         2)
+    case("  (inside the command name: gi\\ t)", "gi\\\nt push origin main", dirty, 2)
+    two_remotes = repo({"a.md": LEAK})
+    git(two_remotes, "remote", "add", "public", PUBLIC_URL)
+    case("  (before the remote: git push \\ public main)", "git push \\\n  public main", two_remotes,
+         2, gh="BYURL")
+    case("a quoted command name (g'i't push)", "g'i't push origin main", dirty, 2)
+    case("  (\"gi\"t)", '"gi"t push origin main', dirty, 2)
+    case("  (every word quoted apart: g'i't p'u'sh)", "g'i't p'u'sh origin main", dirty, 2)
+    case("zsh expands =git to git's path", "=git push origin main", dirty, 2)
+    case("  (after a wrapper: nohup =git)", "nohup =git push origin main", dirty, 2)
+    case("  (run by xargs: xargs =git)", "echo origin | xargs =git push", dirty, 2)
+    case("a command name built by a substitution runs a push ($(which git) push)",
+         "$(which git) push origin main", clean, 2, expect_in="command name")
+    case("  (a variable: ${GIT:-git} push)", "${GIT:-git} push origin main", clean, 2,
+         expect_in="command name")
+    case("  (an ANSI-C escape: $'\\x67it' push)", "$'\\x67it' push origin main", clean, 2,
+         expect_in="command name")
+    case("  (run by xargs: xargs ${GIT} push)", "echo origin | xargs ${GIT} push", clean, 2,
+         expect_in="command name")
+    case("git subtree push publishes a split of this history",
+         "git subtree push --prefix=docs origin main", dirty, 2)
+    case("  (the prefix before the subcommand: git subtree -P docs push)",
+         "git subtree -P docs push origin main", dirty, 2)
+    case("git send-pack is the plumbing behind push", f"git send-pack {PUBLIC_URL} main", dirty,
+         2)
+    case("git lfs push uploads LFS objects", "git lfs push origin main", dirty, 2)
+    case("gh gist edit --add a leaky file (the gist's visibility is not checked)",
+         "gh gist edit 0123abcd --add docs/spec.md", dirty, 2)
+    case("  (a local file replacing a gist file)",
+         "gh gist edit 0123abcd --filename a.md docs/spec.md", dirty, 2)
+    case("  (the description)", 'gh gist edit 0123abcd --desc "internal-dashboard notes"', clean, 2)
+    case("gh issue close --comment posts text", 'gh issue close 5 --comment "seen in Exampleville"',
+         clean, 2)
+    case("  (gh pr close -c)", 'gh pr close 5 -c "seen in Exampleville"', clean, 2)
+    case("  (gh issue reopen -c)", 'gh issue reopen 5 -c "seen in Exampleville"', clean, 2)
+    case("  (gh pr merge --body: the merge commit)", 'gh pr merge 5 --body "seen in Exampleville"',
+         clean, 2)
+    case("  (gh pr merge -t: its subject)", 'gh pr merge 5 -t "internal-dashboard"', clean, 2)
+    case("  (gh pr merge -F <leaky file>)", "gh pr merge 5 -F docs/spec.md", dirty, 2)
+    case("gh repo edit --description on a public repo", 'gh repo edit --description "internal-dashboard"',
+         clean, 2)
+    case("  (gh's help unreadable: a glued -dVALUE)", 'gh repo edit -d"internal-dashboard"', clean,
+         2, env={"GH_NO_HELP": "1"})
+    case("  (another repo named, --homepage)",
+         "gh repo edit example/public-repo -h https://example.test/internal-dashboard", notrepo, 2,
+         gh="BYURL")
+    case("an unquoted $(...) stays inside its word (git -C $(pwd) push)",
+         "git -C $(pwd) push origin main", dirty, 2)
+    case("  (git -c name=$(whoami) push)", "git -c user.name=$(whoami) push origin main", dirty,
+         2)
+    case("  (backquotes: git -C `git rev-parse --show-toplevel` push)",
+         "git -C `git rev-parse --show-toplevel` push origin main", dirty, 2)
+    case("text read from a file by $(cat ...) (gh issue create --body \"$(cat f)\")",
+         'gh issue create -t x --body "$(cat docs/spec.md)"', dirty, 2, expect_in="spec.md")
+    case("  (unquoted backquotes)", "gh pr comment 5 --body `cat docs/spec.md`", dirty,
+         2)
+    case("  (< redirect)", 'gh pr comment 5 --body "$(< docs/spec.md)"', dirty, 2,
+         expect_in="spec.md")
+    case("  (inside an unquoted heredoc in the body)",
+         'gh pr create -t x --head main --body "$(cat <<EOF\nNotes:\n$(cat docs/spec.md)\nEOF\n)"',
+         dirty, 2)
+    case("  (an API field)", 'gh api repos/example/public-repo/issues -f body="$(cat docs/spec.md)"',
+         dirty, 2)
+    case("the usual PR body form, carrying private text",
+         "gh pr create -t x --head main --body \"$(cat <<'EOF'\nSeen in Exampleville.\nEOF\n)\"",
+         clean, 2)
+    case("  (${GIT:-/usr/bin/git} push)", "${GIT:-/usr/bin/git} push origin main", clean, 2,
+         expect_in="command name")
+    case("a command name AND its subcommand built by variables (\"$g\" \"$p\")",
+         'g=git; p=push; "$g" "$p" origin main', clean, 2, expect_in="command name")
+    case("text piped in through $(cat -)",
+         'printf x | gh issue create -t note --body "$(cat -)"', clean, 2, expect_in="stdin")
+    case("text from a shell variable (--title \"$BODY\")", 'gh issue create -t "$BODY" --body ok',
+         clean, 2, expect_in="variable")
+    case("  (a variable in an unquoted heredoc body)",
+         'gh pr create -t x --head main --body "$(cat <<EOF\nhi $NOTES\nEOF\n)"', clean, 2,
+         expect_in="variable")
+    case("a pager set with git -c runs a command (core.pager)",
+         "git -c core.pager='git push origin main' log", dirty, 2)
+    case("  (GIT_PAGER=...)", "GIT_PAGER='git push origin main' git log", dirty, 2)
+    case("  (MANPAGER=... man)", "MANPAGER='git push origin main' man ls", dirty, 2)
+    case("  (man --pager=...)", "man --pager='git push origin main' ls", dirty, 2)
+    case("  (man -P glued)", "man -P'git push origin main' ls", dirty, 2)
+    case("text that is the output of another command is unseen",
+         'gh issue create -t x --body "$(git log -1 --format=%B)"', clean, 2,
+         expect_in="cannot run")
+    case("an external cd's target stays a candidate (timeout)",
+         f"timeout 5 cd {dirty}; git push origin main", notrepo, 2)
+    case("  (coproc)", f"coproc cd {dirty}; git push origin main", notrepo, 2)
+    case("an unknown option may take the next word as its value (nice -Z echo ...)",
+         "nice -Z echo git push origin main", dirty, 2)
+    case("a shift in $((...)) starts no heredoc", "echo $((1<<2))\ngit push origin main\n2",
+         dirty, 2)
+    case("a value glued to its option (env -C<dir>)", f"env -C{dirty} git push origin main",
+         notrepo, 2)
+    case("  (inside an option cluster: env -iC <dir>)", f"env -iC {dirty} git push origin main",
+         notrepo, 2)
+    case("  (env -S'...')", "env -S'git push origin main'", dirty, 2)
+    case("  (a long option's glued value: env --chdir=<dir>)",
+         f"env --chdir={dirty} git push origin main", notrepo, 2)
+    case("git -c include.path=... (config from another file)",
+         "git -c include.path=/elsewhere/cfg push origin main", clean, 2, expect_in="include")
+    case("an alias defined inline with git -c", "git -c 'alias.ship=push origin main' ship",
+         dirty, 2)
+    case("an alias defined through GIT_CONFIG_* variables",
+         'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.ship GIT_CONFIG_VALUE_0="push origin main" '
+         "git ship", dirty, 2)
+    case("  (exported earlier in the command)",
+         'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.ship '
+         'GIT_CONFIG_VALUE_0="push origin main"; git ship', dirty, 2)
+    case("  (exported, no value naming a push: the alias is in an included file)",
+         "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path GIT_CONFIG_VALUE_0=../ship.cfg; "
+         "git ship", dirty, 2)
+    case("an alias defined through git --config-env", "git --config-env alias.ship=SHIP ship",
+         dirty, 2)
+    dash = base / "repos" / "-dash"
+    subprocess.run(["git", "clone", "-q", str(dirty), str(dash)], capture_output=True)
+    case("F1 cd -- -name goes to a directory whose name starts with -",
+         "cd -- -dash && git push origin main", base / "repos", 2)
+    case("F1 popd +N (which entry leaves is not tracked)",
+         f"pushd {dirty} && pushd {clean} && popd +1 && git push origin main", clean, 2,
+         expect_in="could not resolve")
+    case("F1 a case pattern's ) does not close a subshell",
+         f"( case x in a) cd {clean};; esac; git push origin main )", dirty, 2)
+    case("a push inside a case inside a quoted $(...)",
+         'echo "$(case x in *) git push origin main;; esac)"', dirty, 2)
+    case("a push inside a function name { } body", "function f { git push origin main; }; f",
+         dirty, 2)
+    case("F1 a cd inside a function name { } body",
+         f"function f {{ cd {dirty}; }}; f; git push origin main", clean, 2)
+    case("F1 a cd inside a function name { } that is never called",
+         f"function f {{ cd {clean}; }}; git push origin main", dirty, 2)
+    case("F2 an unquoted heredoc runs its $(...)", "cat <<EOF\n$(git push origin main)\nEOF",
+         dirty, 2)
+    case("F2 an escaped ) does not end a heredoc's $(...)",
+         "cat <<EOF\n$(printf \\); git push origin main)\nEOF", dirty, 2)
+    case("an escaped ) does not end a quoted $(...)",
+         'echo "$(printf \\); git push origin main)"', dirty, 2)
+    case("an escaped backtick does not end a backtick substitution",
+         "echo \"`printf '\\`'; git push origin main`\"", dirty, 2)
+    case("single quotes inside double quotes do not stop a $(...)",
+         "echo \"'$(git push origin main)'\"", dirty, 2)
+    case("a git subcommand from a variable blocks", 'p=push; git "$p" origin main', dirty, 2,
+         expect_in="variable")
+    case("F2 an unquoted heredoc runs its backticks", "cat <<EOF\n`git push origin main`\nEOF",
+         dirty, 2)
+    bare = base / "bare-dirty.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(dirty), str(bare)], capture_output=True)
+    # a public remote that lacks these commits: left as the clone source, origin already has
+    # every commit, so git sends nothing -- and the hook asks the remote (git ls-remote)
+    git(bare, "remote", "set-url", "origin", PUBLIC_URL)
+    case("F3 a push from a bare repository", "git push origin main", bare, 2)
+    case("F3 a push from inside a .git directory", "git push origin main", dirty / ".git", 2)
+    r = repo()
+    git(r, "branch", "side")
+    (r / "main.md").write_text(CLEAN)
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "main")
+    git(r, "checkout", "-q", "side")
+    (r / "side.md").write_text(CLEAN)
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "side")
+    git(r, "checkout", "-q", "main")
+    git(r, "merge", "-q", "--no-commit", "--no-ff", "side")
+    (r / "only-at-merge.md").write_text(LEAK)
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "merge")
+    git(r, "rm", "-q", "only-at-merge.md")
+    git(r, "commit", "-qm", "remove")
+    case("F4 content added only by a merge commit, deleted later", "git push origin main", r, 2,
+         expect_in="(unpushed commits)")
+    r = repo()
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=r, input=LEAK,
+                          capture_output=True, text=True).stdout.strip()
+    git(r, "update-ref", "refs/tags/blob", blob)
+    case("F5 a tag pointing straight at a blob", "git push origin refs/tags/blob", r, 2)
+    r = repo()
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=r, input=LEAK,
+                          capture_output=True, text=True).stdout.strip()
+    case("F5 a blob pushed by its hash", f"git push origin {blob}:refs/tags/x", r, 2)
+    git(r, "tag", "-a", "-m", "note", "annotated-blob", blob)
+    case("F5 an annotated tag pointing at a blob", "git push origin refs/tags/annotated-blob",
+         r, 2)
+    r = repo({"a.md": CLEAN})
+    (r / "a.md").write_text("++ @pgdst@/" + LEAK)
+    git(r, "commit", "-qam", "add line")
+    (r / "a.md").write_text(CLEAN)
+    git(r, "commit", "-qam", "remove line")
+    case("F6 a committed line shaped like a diff header", "git push origin main", r, 2,
+         expect_in="(unpushed commits)")
+    r = repo()
+    (r / "exampleville-plan.md").write_text(CLEAN)
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "plan")
+    git(r, "rm", "-q", "exampleville-plan.md")
+    git(r, "commit", "-qm", "remove")
+    case("a private file name that exists only in an unpushed commit", "git push origin main",
+         r, 2, must_not_print="exampleville")
+    r = repo()
+    (r / "secretdir").mkdir()
+    (r / "secretdir" / "plan.md").write_text(CLEAN)  # the same blob as README.md
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "plan")
+    git(r, "rm", "-rq", "secretdir")
+    git(r, "commit", "-qm", "remove")
+    case("a private path (a/b) of a blob also stored under another name",
+         "git push origin main", r, 2, terms="secretdir/plan\n")
+    r = repo()
+    (r / "big.bin").write_bytes(b"x" * 20_000_001)
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "big")
+    git(r, "rm", "-q", "big.bin")
+    git(r, "commit", "-qm", "remove")
+    case("a blob over the size cap in an unpushed commit", "git push origin main", r, 2,
+         expect_in="could not be scanned")
+    r = repo()
+    (r / "a-leak.md").write_text(LEAK)
+    (r / "z-big.bin").write_bytes(b"y" * 9_000_000)
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "both")
+    git(r, "rm", "-q", "a-leak.md", "z-big.bin")
+    git(r, "commit", "-qm", "remove")
+    case("history larger than one read batch is read in full", "git push origin main", r, 2,
+         expect_in="(unpushed commits)")
+    unborn = base / "unborn"
+    unborn.mkdir()
+    git(unborn, "init", "-q", "-b", "main")
+    git(unborn, "remote", "add", "origin", PUBLIC_URL)
+    (unborn / "a.md").write_text(LEAK)
+    git(unborn, "add", "a.md")
+    (unborn / "a.md").write_text(CLEAN)
+    case("a leak staged before the first commit", "git commit -m x && git push", unborn, 2,
+         expect_in="(staged changes)")
+    wrap = base / "git-fails-batch-check"
+    wrap.mkdir()
+    (wrap / "git").write_text('#!/bin/sh\ncase "$*" in *--batch-check*) exit 1 ;; esac\n'
+                              f'exec {shutil.which("git")} "$@"\n')
+    (wrap / "git").chmod(0o755)
+    case("git failing to look objects up blocks", "git push origin main",
+         cleaned(repo({"a.md": LEAK})), 2, expect_in="could not list",
+         env={"PATH": f"{wrap}{os.pathsep}{base / 'bin'}{os.pathsep}{os.environ['PATH']}"})
+    r = repo()
+    git(r, "update-index", "--add", "--cacheinfo", f"100644,{'1' * 40},ghost.md")
+    case("a staged entry git cannot read blocks", "git push", r, 2, expect_in="could not list")
+
     # --- must stay quiet
     case("a clean tree publishes", "git push origin main", clean, 0)
+    case("a cd that certainly runs leaves the old directory behind",
+         f"cd {clean} && git push origin main", dirty, 0)
+    case("  (on its own line)", f"cd {clean}\ngit push origin main", dirty, 0)
+    case("  (a comment after it does not undo it)",
+         f"cd {clean} && git push origin main  # ship it", dirty, 0)
+    case("env -C <dir> moves only the command it runs",
+         f"env -C {dirty} true; git push origin main", clean, 0)
+    case("  (a git command run there)", f"env -C {dirty} git status; git push origin main",
+         clean, 0)
+    case("  (after an option the gate does not know)",
+         f"env -C {dirty} --weird true; git push origin main", clean, 0)
+    case("command -v only names the command", "command -v git push", dirty, 0)
+    case("  (-V, in a cluster)", "command -pV git push", dirty, 0)
+    case("printing words that say git push runs nothing", "echo git push origin main", dirty, 0)
+    case("a quoted heredoc delimiter with a dash",
+         "cat <<'END-OF-DATA'\ngit push origin main\nEND-OF-DATA", dirty, 0)
+    case("  (double quotes and a dot)", 'cat <<"END.DATA"\ngit push origin main\nEND.DATA',
+         dirty, 0)
+    case("  (a backslash quotes it)", "cat <<\\EOF\ngit push origin main\nEOF", dirty, 0)
+    case("  (unquoted, with a dash)", "cat <<END-OF-DATA\ngit push origin main\nEND-OF-DATA",
+         dirty, 0)
+    case("  (a backslash-quoted body's $(...) is data)",
+         "cat <<\\EOF\n$(git push origin main)\nEOF", dirty, 0)
+    case("noglob cd leaves the old directory behind", f"noglob cd {clean}; git push origin main",
+         dirty, 0)
+    case("a heredoc delimiter joined from quoted pieces",
+         "cat <<'EOF'\"-data\"\nEOF\ngit push origin main\nEOF-data", dirty, 0)
+    case("  (partly quoted: E\"O\"F)", 'cat <<E"O"F\n$(git push origin main)\nEOF', dirty, 0)
+    case("ripgrep without --pre only searches", "rg -n git push", dirty, 0)
+    case("a $ in a heredoc delimiter: the body is data",
+         "cat <<EOF$mark\ngit push origin main\nEOF$mark", dirty, 0)
+    case("a backslash-newline in an ordinary command", "git \\\n  status", dirty, 0)
+    case("  (inside single quotes it is literal text)", "echo 'git \\\n push origin main'", dirty,
+         0)
+    case("a script under $(git rev-parse ...) is not a command name built by a substitution",
+         "$(git rev-parse --show-toplevel)/scripts/check.sh push", dirty, 0)
+    case("another program's push (docker push)", "docker push example/image", dirty, 0)
+    case("git subtree split publishes nothing", "git subtree split --prefix=docs", dirty, 0)
+    case("git lfs ls-files publishes nothing", "git lfs ls-files", dirty, 0)
+    case("gh issue close with clean text", 'gh issue close 5 --comment "fixed in main"', clean,
+         0)
+    case("gh issue close -c on a PRIVATE repo",
+         'gh issue close 5 -c "seen in Exampleville" -R example/private-repo', notrepo, 0,
+         gh="BYURL")
+    case("gh pr view -c only reads", "gh pr view 5 -c", dirty, 0)
+    case("gh issue close with no text", "gh issue close 5", dirty, 0, gh="FAIL")
+    case("gh repo edit --description with clean text", 'gh repo edit --description "tools"',
+         clean, 0)
+    case("the usual PR body: a quoted heredoc inside $(...)",
+         "gh pr create -t x --head main --body \"$(cat <<'EOF'\n## Summary\nClean text, and "
+         "$(literal) too.\nEOF\n)\"", clean, 0)
+    case("text read from a clean file", 'gh issue create -t x --body "$(cat README.md)"', clean,
+         0)
+    case("an unquoted $(...) argument of echo is not a new command", "echo $(date) git push origin main",
+         dirty, 0)
+    case("git -C $(pwd) without a push", "git -C $(pwd) status", dirty, 0)
+    case("man git push only shows a manual page", "man git push", dirty, 0)
+    case("a [[ ... ]] test compares strings", '[[ "git push" == *push* ]] && echo match', dirty,
+         0)
+    case("  (test / [ ... ])", 'test "git push" = x || [ "git push" = y ]', dirty, 0)
+    case("--recurse-submodules=only pushes the submodules, not the superproject",
+         "git push --recurse-submodules=only origin main", super_only, 0, gh="BYURL")
+    case("a push with --recurse-submodules=check pushes no submodule",
+         "git push --recurse-submodules=check origin main", super_r, 0, gh="BYURL")
+    in_sync = base / "repos" / "in-sync-remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(in_sync)], capture_output=True)
+    r = repo()
+    git(r, "remote", "set-url", "origin", str(in_sync))
+    (Path(r) / "draft.md").write_text(LEAK)
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "draft")
+    git(r, "rm", "-q", "draft.md")
+    git(r, "commit", "-qm", "remove draft")
+    git(r, "push", "-q", "origin", "main")
+    case("history the remote really has is not rescanned (asked with git ls-remote)",
+         "git push origin main", r, 0)
+    # a remote of its own: every fixture is built before any case runs, so moving in_sync on
+    # would also change what the case above sees
+    moved = base / "repos" / "moved-on-remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(in_sync), str(moved)], capture_output=True)
+    r2 = base / "repos" / "moved-on-local"
+    subprocess.run(["git", "clone", "-q", str(moved), str(r2)], capture_output=True)
+    other = base / "repos" / "other-clone"
+    subprocess.run(["git", "clone", "-q", str(moved), str(other)], capture_output=True)
+    git(other, "commit", "-q", "--allow-empty", "-m", "someone else's commit")
+    git(other, "push", "-q", "origin", "main")
+    case("a remote with commits not fetched here: stale tracking refs are not trusted (fetch first)",
+         "git push origin main", r2, 2, expect_in="git fetch")
+    case("a $ inside single quotes is literal text", "gh issue create -t 'costs $5' --body ok",
+         clean, 0)
+    case("an escaped \\$ is literal text", 'gh issue create -t "Use \\$HOME literally" --body ok',
+         clean, 0)
+    case("  (unquoted)", "gh issue create -t Use-\\$HOME --body ok", clean, 0)
+    case("a $VAR inside a quoted heredoc PR body is literal text",
+         "gh pr create -t x --head main --body \"$(cat <<'EOF'\nSet $HOME first.\nEOF\n)\"",
+         clean, 0)
+    case("a variable command with a path argument is not a subcommand",
+         '"$PY" "$(git rev-parse --show-toplevel)/tools/check.py"', dirty, 0)
+    case("git -c with an ordinary value", 'git -c user.name="Probe Person" log -1', dirty, 0)
+    case("text read by cat -- <clean file>", 'gh issue create -t x --body "$(cat -- README.md)"',
+         clean, 0)
+    case("git lfs push --dry-run sends nothing", "git lfs push --dry-run origin main", dirty, 0)
+    case("git subtree is git's own command, not an alias", "GIT_CONFIG_COUNT=0 git subtree split -P docs",
+         dirty, 0)
+    case("gh repo edit naming a PRIVATE repo", 'gh repo edit example/private-repo -d "internal-dashboard"',
+         notrepo, 0, gh="BYURL")
+    case("a $(...) assignment then an ordinary command",
+         "top=$(git rev-parse --show-toplevel) && ls $top", dirty, 0)
+    case("an escaped quote does not hide a real heredoc",
+         'echo \\"<<EOF\ngit push origin main\nEOF', dirty, 0)
+    case("a wrapped command whose arguments say git push", "command echo git push origin main",
+         dirty, 0)
+    case("  (after a flag the gate knows)", "env -i echo git push origin main", dirty, 0)
+    case("  (after --)", "env -- echo git push origin main", dirty, 0)
+    case("an inline alias that does not push", "git -c alias.st=status st", dirty, 0)
+    case("  (command cd is the shell's own cd)", f"command cd {clean} && git push origin main",
+         dirty, 0)
+    case("  (a case statement that has closed)",
+         f"case x in a) :;; esac; cd {clean} && git push origin main", dirty, 0)
+    case("a subshell holding a closed case still restores the directory",
+         f"(cd {dirty}; case x in a) :;; esac); git push origin main", clean, 0)
+    case("  (after an if that has already closed)",
+         f"if true; then :; fi; cd {clean} && git push origin main", dirty, 0)
+    case("a single-quoted $(...) is inert text", "echo '$(git push origin main)'", dirty, 0)
+    case("  (single-quoted backticks too)", "echo '`git push origin main`'", dirty, 0)
+    case("a variable in an ordinary git command", 'git log "$range"', dirty, 0)
+    case("a quoted heredoc's $(...) is inert text", "cat <<'EOF'\n$(git push origin main)\nEOF",
+         dirty, 0)
+    clean_bare = base / "bare-clean.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(clean), str(clean_bare)],
+                   capture_output=True)
+    case("a clean bare repository publishes", "git push origin main", clean_bare, 0)
+    r = repo()
+    git(r, "branch", "side")
+    git(r, "checkout", "-q", "side")
+    (r / "side.md").write_text(CLEAN)
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "side")
+    git(r, "checkout", "-q", "main")
+    git(r, "merge", "-q", "--no-ff", "-m", "merge", "side")
+    case("a clean repository with a merge commit publishes", "git push origin main", r, 0)
+    empty = base / "empty"
+    empty.mkdir()
+    git(empty, "init", "-q", "-b", "main")
+    git(empty, "remote", "add", "origin", PUBLIC_URL)
+    case("a repository with no commits yet", "git push origin main", empty, 0)
+    r = repo()
+    sub = r / "vendor"
+    sub.mkdir()
+    git(sub, "init", "-q", "-b", "main")
+    (sub / "x.md").write_text(CLEAN)
+    git(sub, "add", "-A")
+    git(sub, "commit", "-qm", "init")
+    git(r, "add", "vendor")
+    case("a staged submodule (its commit is not in this repository)", "git push", r, 0)
+    r = repo({"a.md": CLEAN, "b.md": CLEAN})
+    git(r, "rm", "-q", "b.md")
+    case("a staged deletion", "git push", r, 0)
+    r = repo()
+    subprocess.run(["git", "-c", "user.name=Exampleville", "-c", "user.email=probe@example.com",
+                    "commit", "-q", "--allow-empty", "-m", "ordinary"], cwd=r,
+                   capture_output=True)
+    case("a commit author name is identity config, not content (a stated limit)", "git push",
+         r, 0)
     case("a private destination is not this gate's business", "git push origin main", dirty, 0,
          gh="BYURL")
     case("  a bare push to a private origin", "git push", dirty, 0, gh="BYURL")
@@ -416,6 +1106,28 @@ def build(base: Path) -> None:
     case("git stash push", "git stash push -m wip", dirty, 0)
     case("git log --grep push", "git log --grep push", dirty, 0)
     case("git push --dry-run sends nothing", "git push --dry-run origin main", dirty, 0)
+    case("  (-vn, and --dry-r: an abbreviated --dry-run)",
+         "git push -vn origin main; git push --dry-r origin main", dirty, 0)
+    case("  QUIET: --no-dry-run, then --dry-run", "git push --no-dry-run --dry-run origin main",
+         dirty, 0)
+    case("-on is `-o n` (a push option), not a dry run", "git push -on origin main", dirty, 2)
+    case("  (-o --dry-run: the option's value)", "git push -o --dry-run origin main", dirty, 2)
+    case("  (--exec --dry-run: the option's value)", "git push --exec --dry-run origin main", dirty,
+         2)
+    case("  (--dry-run --no-dry-run: the last wins)", "git push --dry-run --no-dry-run origin main",
+         dirty, 2)
+    case("git subtree push has no --dry-run (the word is -P's value)",
+         "git subtree push -P --dry-run origin main", dirty, 2)
+    r = repo({"a.md": LEAK})
+    case("a positional repository beats --repo (git pushes to the public one)",
+         f"git push --repo={PRIVATE_URL} {PUBLIC_URL} main", r, 2, gh="BYURL")
+    case("  (an abbreviated --rep=URL is the destination)", f"git push --rep={PUBLIC_URL}", r,
+         2, gh="BYURL")
+    case("  QUIET: --rep= a private URL", f"git push --rep={PRIVATE_URL}", r, 0, gh="BYURL")
+    git(r, "remote", "set-url", "origin", PUBLIC_URL)
+    git(r, "remote", "set-url", "--push", "origin", PRIVATE_URL)
+    case("send-pack --remote NAME: the next word is its value, not the destination",
+         f"git send-pack --remote origin {PUBLIC_URL} main", r, 2, gh="BYURL")
     case("  (git push -n)", "git push -n", dirty, 0)
     case("git -c push.default=current push to a private repo",
          "git -c push.default=current push", dirty, 0, gh="BYURL")
@@ -493,7 +1205,9 @@ def run_cases(base: Path, source: str, stop_at_first_failure: bool = False,
         if terms_text not in hooks:
             hooks[terms_text] = install(base, source, terms_text)
         env = {**os.environ, "PATH": f"{base / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
-               "HOME": str(base / 'home'), "GH_MODE": c["gh"], **c["env"]}
+               "HOME": str(base / 'home'), "GH_MODE": c["gh"],
+               "GIT_ALLOW_PROTOCOL": "file",  # the hook's git never reaches the network here
+               **c["env"]}
         try:
             p = subprocess.run([sys.executable, str(hooks[terms_text])], input=c["stdin"],
                                text=True, capture_output=True, env=env, timeout=120)
@@ -538,32 +1252,32 @@ MUTATIONS = [
      '            parsed.force_add = True',
      '            pass'),
     ('staged index not scanned',
-     'self.lines("(staged changes)", staged, added_only=True)',
-     'pass'),
+     'or (worktree and not self.staged(root)):',
+     'or False:'),
     ('unpushed commits not scanned',
-     'self.lines("(unpushed commits)", log, added_only=True)',
-     'pass'),
+     '            wanted.append((oid, f"(unpushed commits) {path}".rstrip()))',
+     '            pass'),
     ('history the PRIVATE remote has is skipped for a public one',
      'return refs + ["--not", f"--remotes={remote}"]',
      'return refs + ["--not", "--remotes"]'),
     ('every push scans all history',
-     '        if outgoing is not None:\n            scan.repo(root, parsed.force_add, outgoing)\n\n    elif kind == "repo-create":',
-     '        if outgoing is not None:\n            scan.repo(root, parsed.force_add, ["--all"])\n\n    elif kind == "repo-create":'),
+     '            scan.repo(root, worktree, parsed.force_add, outgoing)\n\n    elif kind == "repo-create":',
+     '            scan.repo(root, worktree, parsed.force_add, ["--all"])\n\n    elif kind == "repo-create":'),
     ('making public scans only unpushed history',
-     '        else:\n            scan.repo(root, parsed.force_add, ["--all"])',
-     '        else:\n            scan.repo(root, parsed.force_add, ["--branches", "--not", "--remotes"])'),
+     '        else:\n            scan.repo(root, worktree, parsed.force_add, ["--all"])',
+     '        else:\n            scan.repo(root, worktree, parsed.force_add, ["--branches", "--not", "--remotes"])'),
     ('binary staged diff hidden',
-     '"--text", "--no-color", "-U0", "--src',
-     '"--no-color", "-U0", "--src'),
+     '                elif kind == "blob":\n                    self.content(label, body)',
+     '                elif kind == "blob":\n                    if b"\\0" not in body:\n                        self.content(label, body)'),
     ('diff content lines starting ++ skipped',
-     'line.startswith(DIFF_HEADERS)',
-     'line.startswith("+++")'),
+     '            if skip and skip.match(line):',
+     '            if (skip and skip.match(line)) or line.startswith("++ @pgdst@/"):'),
     ('staged diff not run with the shared diff args',
-     'staged = run(["git", "diff", "--cached", *DIFF_ARGS], root)',
-     'staged = run(["git", "diff", "--cached", "--no-color", "-U0"], root)'),
+     '_, mode, _, oid = meta.split()[:4]',
+     '_, mode, oid, _ = meta.split()[:4]'),
     ('file names not scanned',
-     '        if self.rule(label):\n',
-     '        if False:\n'),
+     '        number = self.rule(text)\n        if number:\n',
+     '        number = self.rule(text)\n        if False:\n'),
     ('file name echoed',
      'return "(a file name)" if self.rule(name) else name',
      'return name'),
@@ -577,8 +1291,8 @@ MUTATIONS = [
      'if os.path.getsize(path) > MAX_FILE_BYTES:',
      'if False:'),
     ('unreadable file allowed',
-     '        except OSError:\n            self.unscannable.append(label)\n            return\n        self.lines',
-     '        except OSError:\n            return\n        self.lines'),
+     '        except OSError:\n            self.unscannable.append(label)\n            return\n        self.content(label, data)',
+     '        except OSError:\n            return\n        self.content(label, data)'),
     ('unseen publishes allowed',
      '    if scan.unseen:\n',
      '    if False:\n'),
@@ -607,26 +1321,26 @@ MUTATIONS = [
      'return change_dir(dirs, targets[0] if targets else "~")',
      'return dirs'),
     ('subshell cd leaks out',
-     '                elif ch == ")" and stack:\n                    dirs = stack.pop()',
-     '                elif ch == ")" and stack:\n                    stack.pop()'),
+     '                if stack and stack[-1] is not CASE:\n                    dirs, start, stops, cond = stack.pop()',
+     '                if stack and stack[-1] is not CASE:\n                    stack.pop()'),
     ('popd ignored',
      'return parsed.pushd.pop() if parsed.pushd else None',
      'return dirs'),
     ('failed cd drops the old dir',
-     '        if not os.path.isdir(new):\n            out.append(d)\n',
+     '        if not (os.path.isdir(new) and os.access(new, os.X_OK)):\n            out.append(d)\n',
      ''),
     ('variable cd trusted',
-     'if dirs is None or target == "-" or re.search(r"[$`*?]", target):',
-     'if dirs is None or target == "-":'),
+     'if dirs is None or target == "-" or re.search(r"[$`*?]", target) \\',
+     'if dirs is None or target == "-" or False \\'),
     ('sh -c not followed',
      '                nested(args[j + 1], dirs, parsed, depth)',
      '                pass'),
     ('eval not followed',
-     '        nested(" ".join(args), dirs, parsed, depth)',
-     '        pass'),
+     '        return nested(" ".join(args), dirs, parsed, depth)',
+     '        return dirs'),
     ('timeout wrapper not stripped',
-     '        elif cmd[i] == "timeout":',
-     '        elif False:'),
+     '        elif command_name(cmd[i]) in WRAPPERS | {"timeout"}:',
+     '        elif command_name(cmd[i]) in WRAPPERS:'),
     ('VAR= prefix not stripped',
      '        if ASSIGNMENT.match(cmd[i]) or cmd[i] in KEYWORDS:',
      '        if cmd[i] in KEYWORDS:'),
@@ -634,8 +1348,8 @@ MUTATIONS = [
      '        if ASSIGNMENT.match(cmd[i]) or cmd[i] in KEYWORDS:',
      '        if ASSIGNMENT.match(cmd[i]):'),
     ('quoted $(...) not walked',
-     '        for script in substitutions(tok):\n            nested(script, dirs, parsed, depth)',
-     '        for script in substitutions(tok):\n            pass'),
+     '            for script in substitutions(tok):\n                nested(script, dirs, parsed, depth)',
+     '            for script in substitutions(tok):\n                pass'),
     ('quotes ignored when matching $( ... ) parens',
      '                elif ch in "\'\\"":\n                    quote = ch',
      '                elif False:\n                    quote = ch'),
@@ -648,18 +1362,15 @@ MUTATIONS = [
     ('newline not a separator',
      'punctuation_chars=";&|()\\n"',
      'punctuation_chars=";&|()"'),
-    ('xargs/find not followed',
-     '    elif word in FANOUT and "git" in args:',
-     '    elif False:'),
     ('aliases not expanded',
      '                nested(script + " " + shlex.join(rest), (d,), parsed, depth)',
      '                pass'),
     ("plain git aliases lose their 'git'",
-     'script = alias[1:] if alias.startswith("!") else "git " + alias',
-     'script = alias[1:] if alias.startswith("!") else alias'),
+     '            if alias:\n                script = alias[1:] if alias.startswith("!") else "git " + alias',
+     '            if alias:\n                script = alias[1:] if alias.startswith("!") else alias'),
     ('commit messages not scanned',
-     'self.lines("(commit messages)", messages)',
-     'pass'),
+     '                    self.content(label, header, IDENTITY)\n                    self.content(label, message)\n',
+     '                    pass\n'),
     ('branch/tag names not scanned',
      'self.lines("(branch and tag names, tag messages)", refs)',
      'pass'),
@@ -676,7 +1387,7 @@ MUTATIONS = [
      'refs = ["--branches", "--tags", "HEAD"] + [',
      'refs = ["--branches", "--tags"] + ['),
     ('refspec sources not in range',
-     '            and run(["git", "rev-parse", "--verify", "-q", s + "^{commit}"], root)]',
+     '            and run(["git", "rev-parse", "--verify", "-q", s], root)]',
      '            and False]'),
     ('-c remote config trusted',
      '                parsed.redirected = True  # e.g. -c remote.origin.url=...: a destination we',
@@ -688,14 +1399,14 @@ MUTATIONS = [
      'os.path.expanduser(storage or "lfs")',
      '"lfs"'),
     ('--dry-run treated as a publish',
-     'if not any(r == "--dry-run" or re.match(r"^-[a-zA-Z]*n[a-zA-Z]*$", r) for r in rest):',
-     'if True:'),
+     '        if not dry_run(opts):',
+     '        if True:'),
     ('gh api body files not read for visibility/mutation',
      '"\\n" + read_text(os.path.join(d, os.path.expanduser(f)))',
      '""'),
     ('gh api stdin body allowed',
      '            scan.unseen.append("an API body read from stdin")\n            return\n',
-     ''),
+     '            pass\n'),
     ('LFS objects not scanned',
      'self.file(str(obj), "(a Git LFS object)")',
      'pass'),
@@ -706,7 +1417,7 @@ MUTATIONS = [
      '        if in_repo and (os.path.isdir(path) or not os.path.lexists(path)):',
      '        if False:'),
     ('UTF-8 decoding dropped',
-     'self.lines(label, data.decode("utf-8", "replace"))',
+     'self.lines(label, data.decode("utf-8", "replace"), skip)',
      'pass'),
     ('Latin-1 fallback dropped',
      '        if not data.isascii():',
@@ -718,8 +1429,8 @@ MUTATIONS = [
      '            return  # a write to a private repository',
      '            pass'),
     ('any push word counts',
-     '    if sub == "push":',
-     '    if "push" in args:'),
+     '    elif sub in ("push", "send-pack"):  # send-pack: the plumbing behind push (a URL, refs)',
+     '    elif "push" in args or sub == "send-pack":'),
     ('submodule foreach push allowed',
      '    elif sub == "submodule" and "push" in rest:',
      '    elif False:'),
@@ -730,17 +1441,17 @@ MUTATIONS = [
      '        if "--public" not in args:\n            return\n',
      ''),
     ('repo create --source ignored',
-     'scan.repo(src_root, parsed.force_add, ["--all"])',
+     'scan.repo(src_root, src_worktree, parsed.force_add, ["--all"])',
      'pass'),
     ('repo name/description not scanned',
-     'scan.lines("(the repository name or description)", text)',
+     'scan.command_text("(the repository name or description)", text, d)',
      'pass'),
     ('another repo made public allowed',
      'if named and (local is None or repo_slug(named[0]).lower() != local.lower()):',
      'if False:'),
     ('visibility change not detected',
-     'if "public" in flag_values(rest, "--visibility"):',
-     'if False:'),
+     '        if "public" in (v.lower() for v in flag_values(rest, "--visibility")):\n            parsed.ops.append(("make-public", dirs, rest))',
+     '        if False:\n            parsed.ops.append(("make-public", dirs, rest))'),
     ('gist -p missed',
      'if not ({"--public", "-p"} & set(args)):',
      'if not ({"--public"} & set(args)):'),
@@ -748,8 +1459,8 @@ MUTATIONS = [
      '        if not files or "-" in files:',
      '        if False:'),
     ('gist description not scanned',
-     'scan.lines("(the gist description)", text)',
-     'pass'),
+     'for text in flag_values(args, "--desc", "-d"):\n            scan.command_text("(the gist description)", text, d)\n        files = positionals(args, {"--desc", "-d", "--filename", "-f"})',
+     'for text in flag_values(args, "--desc", "-d"):\n            pass\n        files = positionals(args, {"--desc", "-d", "--filename", "-f"})'),
     ('release visibility ignored',
      '        if not is_public(repo, d):\n            return\n        value_flags = {"--notes"',
      '        if True:\n            return\n        value_flags = {"--notes"'),
@@ -757,10 +1468,10 @@ MUTATIONS = [
      '                scan.file(os.path.join(d, os.path.expanduser(path)), path)',
      '                pass'),
     ('release notes not scanned',
-     'scan.lines("(the release notes or title)", text)',
+     'scan.command_text("(the release notes or title)", text, d)',
      'pass'),
     ('issue/PR text not scanned',
-     'scan.lines("(the issue or PR text)", text)',
+     'scan.command_text("(the issue, PR or repository text)", text, d)',
      'pass'),
     ('issue/PR body files not scanned',
      '                scan.unseen.append("an issue or PR body read from stdin")\n            else:\n                scan.file(os.path.join(d, os.path.expanduser(f)), f)',
@@ -775,13 +1486,13 @@ MUTATIONS = [
      '            scan.unseen.append("a visibility change through `gh api`")\n            return',
      '            return'),
     ('gh api fields not scanned',
-     'scan.lines("(an API field)", value)',
+     'scan.command_text("(an API field)", value, d)',
      'pass'),
     ('gh api GET scanned',
      'if method == "GET" or not (fields or inputs):',
      'if not (fields or inputs):'),
     ('heredoc bodies read as commands',
-     '    command = strip_heredocs(command)\n',
+     '    command = strip_heredocs(command, comments)\n',
      ''),
     ('heredoc fed to a shell dropped',
      '            out.append(command[line_end + 1:end.end()])',
@@ -807,6 +1518,594 @@ MUTATIONS = [
     ('GraphQL reads scanned',
      'and not re.search(r"\\bmutation\\b", joined):',
      'and False:'),
+    ('a cd inside a condition or body trusted',
+     '                if cond or detached or before in ("||", "|", "|&") \\',
+     '                if detached or before in ("||", "|", "|&") \\'),
+    ('a cd feeding a pipe or the background trusted',
+     'before in ("||", "|", "|&") \\\n                        or after in ("|", "|&", "&"):',
+     'before in ("||", "|", "|&"):'),
+    ('a cd after || trusted',
+     'before in ("||", "|", "|&")',
+     'before in ("|", "|&")'),
+    ('a cd at the end of a pipeline trusted',
+     'before in ("||", "|", "|&")',
+     'before in ("||",)'),
+    ('&& chain stop point forgotten',
+     '                if before == "&&":\n                    stops = merge(stops, dirs)\n',
+     ''),
+    ('list end forgets where the chain stopped',
+     '                dirs = merge(dirs, stops)\n                start, stops, before = dirs, (), ";"',
+     '                start, stops, before = dirs, (), ";"'),
+    ('|| forgets where the list started',
+     '                dirs = merge(start, stops, dirs)\n',
+     '                pass\n'),
+    ('opening keywords not counted',
+     '                if word in OPENERS:\n                    cond += 1',
+     '                if word in OPENERS:\n                    pass'),
+    ('closing keywords never end the body',
+     '                    cond = max(0, cond - 1)',
+     '                    pass'),
+    ('candidate directories truncated',
+     '    return out if len(out) <= MAX_DIRS else None',
+     '    return out[:4]'),
+    ('eval cd discarded',
+     '        return nested(" ".join(args), dirs, parsed, depth)',
+     '        nested(" ".join(args), dirs, parsed, depth)\n        return dirs'),
+    ('unquoted heredoc substitutions dropped',
+     '        elif not quoted:',
+     '        elif False:'),
+    ('directory-stack cd trusted',
+     '            or re.match(r"^[+-]\\d+$", target):  # a directory-stack entry',
+     '            :'),
+    ('two-argument cd trusted',
+     '    if len(targets) > 1 or (word == "pushd" and not targets):',
+     '    if (word == "pushd" and not targets):'),
+    ('bare pushd trusted',
+     '    if len(targets) > 1 or (word == "pushd" and not targets):',
+     '    if len(targets) > 1:'),
+    ('unenterable directory trusted',
+     'os.path.isdir(new) and os.access(new, os.X_OK)',
+     'os.path.isdir(new)'),
+    ('bare repository read as no repository',
+     '    return git_path(["rev-parse", "--absolute-git-dir"], d), False',
+     '    return None, False'),
+    ('tree names not scanned',
+     '                        self.name(name)\n',
+     '                        pass\n'),
+    ('tree names not joined to their path',
+     '                        if base:\n',
+     '                        if False:\n'),
+    ('oversized blob allowed',
+     '            if kind == "blob" and length > MAX_FILE_BYTES:\n                self.unscannable.append(label)\n',
+     '            if kind == "blob" and length > MAX_FILE_BYTES:\n'),
+    ('a full read batch dropped',
+     '                read.append(batch)\n',
+     '                pass\n'),
+    ('staged submodule read as a blob',
+     'if mode != "160000" and set(oid)',
+     'if set(oid)'),
+    ('staged deletion read as a blob',
+     ' and set(oid) != {"0"}:',
+     ':'),
+    ('identity lines scanned',
+     'self.content(label, header, IDENTITY)',
+     'self.content(label, header)'),
+    ('unborn HEAD kept in the range',
+     '        revs = [r for r in revs if r != "HEAD"\n',
+     '        revs = [r for r in revs if True\n'),
+    ('missing object read as clean',
+     '                return False  # missing: git cannot vouch for what it would send',
+     '                continue'),
+    ('missing object count ignored',
+     '        if len(found) != len(wanted):\n            return False\n',
+     ''),
+    ('only the comment-free reading walked',
+     '    for comments in (False, True):',
+     '    for comments in (True,):'),
+    ('only the literal reading walked',
+     '    for comments in (False, True):',
+     '    for comments in (False,):'),
+    ('autocd ignored',
+     '    if not args and not external and is_autocd(cmd[0], dirs):',
+     '    if False:'),
+    ('autocd trusted as certain',
+     '        return merge(dirs, change_dir(dirs, cmd[0]))  # bash has no autocd: it may stay put',
+     '        return change_dir(dirs, cmd[0])'),
+    ('external wrapper cd trusted',
+     '            external = external or wrapper not in IN_SHELL\n',
+     ''),
+    ("shell's own cd treated as external",
+     'IN_SHELL = {"command", "builtin", "time", "noglob", "nocorrect", "-"}',
+     'IN_SHELL = set()'),
+    ('function keyword not skipped when counting bodies',
+     '                if word == "function":  # `function name { ... }`\n                    i += 2\n                    continue\n',
+     ''),
+    ('function keyword not stripped from the command',
+     '        elif cmd[i] == "function":\n            i += 2\n',
+     ''),
+    ('coproc cd trusted',
+     '                elif word == "coproc":\n                    detached = True',
+     '                elif word == "coproc":\n                    pass'),
+    ('coproc not stripped',
+     '"!", "{", "coproc"}',
+     '"!", "{"}'),
+    ('case pattern ) closes a subshell',
+     '                    stack.append(CASE)',
+     '                    pass'),
+    ('esac leaves the case frame open',
+     '                    if word == "esac" and stack and stack[-1] is CASE:\n                        stack.pop()',
+     '                    if word == "esac" and stack and stack[-1] is CASE:\n                        pass'),
+    ('case ignored inside a quoted $(...)',
+     '                    cases += 1 if word.group() == "case" else -1 if cases else 0',
+     '                    pass'),
+    ('cd -- does not end options',
+     '        if options and a == "--":\n            options = False',
+     '        if options and a == "--":\n            pass'),
+    ('popd +N trusted',
+     '        if args:  # popd +N',
+     '        if False:  # popd +N'),
+    ('escaped ) ends a substitution',
+     '                if ch == "\\\\" and quote != "\'":  # an escaped ) or quote is just a character\n                    j += 2\n                    continue\n',
+     ''),
+    ('escaped backtick ends a backtick substitution',
+     '                j += 2 if token[j] == "\\\\" else 1',
+     '                j += 1'),
+    ('single-quoted $( and ` read as commands',
+     '    command = hold_substitutions(inert_single_quotes(command))\n',
+     '    command = hold_substitutions(command)\n'),
+    ('single-quoted backticks read as commands',
+     '            ch = "\\1"',
+     '            pass'),
+    ('git subcommand from a variable trusted',
+     '    if re.search(r"[$`]", sub):\n        parsed.ops.append(("unseen", dirs, ["a git subcommand built from a variable"]))\n    elif sub in ("push", "send-pack"):  # send-pack: the plumbing behind push (a URL, refs)',
+     '    if sub in ("push", "send-pack"):  # send-pack: the plumbing behind push (a URL, refs)'),
+    ('quoted << starts a heredoc',
+     '        if quote or ch in "\'\\"":\n            quote = None if ch == quote else quote or ch\n            i += 1\n            continue\n',
+     ''),
+    ('escaped quote hides a real heredoc',
+     '        if ch == "\\\\" and quote != "\'":\n            i += 2\n            continue\n        if quote or ch in',
+     '        if quote or ch in'),
+    ('<< inside a comment starts a heredoc',
+     '        if comments and ch == "#" and',
+     '        if False and ch == "#" and'),
+    ('wrapper option values not consumed',
+     '        if opt in values:\n            rest = tok[k + 1:]',
+     '        if False:\n            rest = tok[k + 1:]'),
+    ('wrapper chdir ignored',
+     '                    dirs = change_dir(dirs, value)',
+     '                    pass'),
+    ('env -S ignored',
+     '                elif wrapper == "env" and opt in ("-S", "--split-string"):',
+     '                elif False:'),
+    ('no fallback after an unknown wrapper option',
+     '    if wrapped and unknown and word not in HANDLED:',
+     '    if False:'),
+    ('wrapper chdir leaks into the shell',
+     '        run_arguments(args, dirs, parsed, depth)\n    return shell_dirs\n',
+     '        run_arguments(args, dirs, parsed, depth)\n    return dirs\n'),
+    ('wrapper fallback returns the wrapped directory',
+     '        run_arguments(cmd[1:], dirs, parsed, depth)\n        return shell_dirs\n',
+     '        run_arguments(cmd[1:], dirs, parsed, depth)\n        return dirs\n'),
+    ("inline alias loses its 'git'",
+     '        alias = inline[sub.lower()]\n        script = alias[1:] if alias.startswith("!") else "git " + alias',
+     '        alias = inline[sub.lower()]\n        script = alias[1:] if alias.startswith("!") else alias'),
+    ('timeout duration read as the command',
+     '            if wrapper == "timeout":\n                i += 1  # the duration\n',
+     ''),
+    ('wrapper named by path missed',
+     '        elif command_name(cmd[i]) in WRAPPERS | {"timeout"}:',
+     '        elif cmd[i] in WRAPPERS | {"timeout"}:'),
+    ('glued short option value ignored',
+     '            return (opt, rest, i + 1, known) if rest else (opt, following, i + 2, known)',
+     '            return (opt, following, i + 2, known)'),
+    ('option cluster not searched',
+     '    for k in range(1, len(tok)):',
+     '    for k in range(1, 2):'),
+    ('glued long option value ignored',
+     '            return (opt, value, i + 1, True) if eq else (opt, following, i + 2, True)',
+     '            return (opt, following, i + 2, True)'),
+    ('-- read as an unknown wrapper option',
+     '                if cmd[i] == "--":\n                    i += 1\n                    break\n',
+     ''),
+    ('fallback without an unknown option',
+     '    if wrapped and unknown and word not in HANDLED:',
+     '    if wrapped and word not in HANDLED:'),
+    ('known wrapper flags treated as unknown',
+     '    "env": {"-", "-i", "-0",',
+     '    "env": {"-", "-0",'),
+    ('inline alias not expanded',
+     '    elif sub.lower() in inline:',
+     '    elif False:'),
+    ('inline alias not recorded',
+     '            if a == "-c" and key.lower().startswith("alias."):\n                inline[key[6:].lower()] = value',
+     '            if a == "-c" and key.lower().startswith("alias."):\n                pass'),
+    ('--config-env alias trusted',
+     '                opaque = True  # an alias from',
+     '                pass  # an alias from'),
+    ('GIT_CONFIG assignment not noticed',
+     '            parsed.env_config = parsed.env_config or cmd[i].startswith("GIT_CONFIG")\n',
+     ''),
+    ('exported GIT_CONFIG not noticed',
+     '        parsed.env_config = True  # an alias defined there',
+     '        pass  # an alias defined there'),
+    ('aliases from config sources the gate cannot read trusted',
+     '    elif sub not in GIT_BUILTINS and opaque:',
+     '    elif False:'),
+    ('-c include not a redirect',
+     'lfs|include|includeif)\\.',
+     'lfs)\\.'),
+    ('zsh precommand modifiers not wrappers',
+     '"time",\n            "noglob", "nocorrect", "-"}',
+     '"time"}'),
+    ('precommand modifiers run outside the shell',
+     'IN_SHELL = {"command", "builtin", "time", "noglob", "nocorrect", "-"}',
+     'IN_SHELL = {"command", "builtin", "time"}'),
+    ('a program that runs its arguments is not searched',
+     '    elif word in FANOUT or word not in HANDLED | PRINTS_ONLY \\\n',
+     '    elif False \\\n'),
+    ('print-only commands searched too',
+     'word not in HANDLED | PRINTS_ONLY \\\n',
+     'word not in HANDLED \\\n'),
+    ('command -v read as running the command',
+     '                    return shell_dirs  # command -v / -V only names the command',
+     '                    pass'),
+    ('command -V not recognised',
+     'set(opt) & set("vV")',
+     'set(opt) & set("v")'),
+    ('single-quoted delimiter limited to a name',
+     "(?:'[^'\\n]*'|",
+     "(?:'[A-Za-z_]*'|"),
+    ('double-quoted delimiter limited to a name',
+     '|\\"[^\\"\\n]*\\"|',
+     '|\\"[A-Za-z_]*\\"|'),
+    ('backslash-quoted delimiter missed',
+     '|\\\\[^\\n]"\n',
+     '"\n'),
+    ('bare delimiter limited to a name',
+     'r"|[^\\s;&|<>()\'\\"`\\\\])+)")',
+     'r"|[A-Za-z0-9_])+)")'),
+    ('partial or backslash quoting ignored',
+     '        quoted = delimiter != m.group(2)  # any quoting makes the body literal',
+     '        quoted = m.group(2)[:1] in "\'\\""'),
+    ('delimiter pieces not joined',
+     'r"|[^\\s;&|<>()\'\\"`\\\\])+)")',
+     'r"|[^\\s;&|<>()\'\\"`\\\\]+))")'),
+    ('a shift in $((...)) read as a heredoc',
+     '(?![0-9])',
+     ''),
+    ('an option value naming git not read',
+     '        if command_name(named) == "git" and "push" in args[k + 1:]:',
+     '        if False:'),
+    ('rg --pre not a runner',
+     '            or word == "rg" and any(a.startswith("--pre") for a in args):',
+     '            or False:'),
+    ('a quoted script word not read',
+     '        if len(a.split()) > 1 and MAYBE_PUBLISH.search(a):',
+     '        if False:'),
+    # Retired 2026-10-07, 'man counted as print-only' (adding man to PRINTS_ONLY): equivalent.
+    # man has its own branch, read before PRINTS_ONLY is; the two mutations of that branch
+    # below are what prove it.
+    ('a backslash-newline not joined',
+     '            if command.startswith("\\n", i + 1):\n                i += 2\n                continue\n',
+     ''),
+    ('the fast path reads the raw command',
+     'MAYBE_PUBLISH.search(re.sub(r"\\\\\\n|[\\\\\'\\"]", "", command))',
+     'MAYBE_PUBLISH.search(command)'),
+    ('push missing from the fast path',
+     'r"\\b(?:git|gh|push)\\b"',
+     'r"\\b(?:git|gh)\\b"'),
+    ('zsh =git not expanded',
+     'word[1:] if word.startswith("=") else word',
+     'word'),
+    ('a command name built by a variable trusted',
+     '    if DYNAMIC.search(word) and ("push" in args or args and DYNAMIC.search(args[0])\n                                 and "/" not in args[0]):  # "$g" "$p": maybe git push',
+     '    if False:'),
+    ('a built command name among arguments trusted',
+     '        if DYNAMIC.search(command_name(named)) and re.search(r"git|gh", named, re.I) \\\n                and "push" in args[k + 1:]:',
+     '        if False:'),
+    ('braces not part of a built command name',
+     'DYNAMIC = re.compile(r"[$`{}]")',
+     'DYNAMIC = re.compile(r"[$`]")'),
+    ('git send-pack not a push',
+     '    elif sub in ("push", "send-pack"):  # send-pack: the plumbing behind push (a URL, refs)',
+     '    elif sub == "push":'),
+    ('git subtree / lfs push not a push',
+     '    elif sub in ("subtree", "lfs") and "push" in rest:',
+     '    elif False:'),
+    ('lfs push --dry-run publishes',
+     '        if (sub == "subtree" or "--dry-run" not in rest) and "push" in words:',
+     '        if (sub == "subtree" or True) and "push" in words:'),
+    ('subtree taken for an alias',
+     'write-tree lfs subtree send-pack\n',
+     'write-tree lfs\n'),
+    ('gist edit not a publish',
+     '    elif group == "gist" and action == "edit":\n        parsed.ops.append(("gist-edit", dirs, rest))\n',
+     ''),
+    ('gist edit --add not scanned',
+     ' + flag_values(args, "--add", "-a")',
+     ''),
+    ('gist edit local file not scanned',
+     '"-r"})[1:] + flag_values',
+     '"-r"})[1:1] + flag_values'),
+    ('gist edit description not scanned',
+     'for text in flag_values(args, "--desc", "-d"):\n            scan.command_text("(the gist description)", text, d)\n        files = positionals(args, {"--add", "-a",',
+     'for text in flag_values(args, "--desc", "-d"):\n            pass\n        files = positionals(args, {"--add", "-a",'),
+    ('repo edit text not read',
+     '        text(flag_values(rest, "--description", "-d", "--homepage", "-h", "--add-topic"),\n             named[0] if named else None)',
+     '        text([],\n             named[0] if named else None)'),
+    ("repo edit's named repository ignored",
+     '             named[0] if named else None)',
+     '             None)'),
+    ('only four issue/PR actions post text',
+     'action not in GH_READS:',
+     'action in ("create", "comment", "edit", "review"):'),
+    ('--comment not read as text',
+     '"--subject", "--comment", "-c")',
+     '"--subject")'),
+    ('unquoted $(...) split from its word',
+     '    command = hold_substitutions(inert_single_quotes(command))\n',
+     '    command = inert_single_quotes(command)\n'),
+    ('a held script not handed back',
+     '            out.append(HELD[int(held.group(1))])\n',
+     ''),
+    ('a $(...) inside double quotes held',
+     '                if quote:\n                    out.append(command[i:end])\n',
+     '                if False:\n                    pass\n'),
+    ('quote state ignored when holding',
+     '        if ch in "\'\\"" and quote in (None, ch):',
+     '        if False:'),
+    ('backquotes not held',
+     '(command.startswith("$(", i) or ch == "`")',
+     '(command.startswith("$(", i))'),
+    ('text from $(cat FILE) not scanned',
+     '            for f in paths:\n                self.file(os.path.join(d, os.path.expanduser(f)), f)\n',
+     '            for f in paths:\n                pass\n'),
+    ("another command's output trusted as text",
+     '            if not files:\n                self.unseen.append(',
+     '            if not files:\n                continue\n                self.unseen.append('),
+    ('an unquoted heredoc in text not read',
+     '                if not re.search(r"[\'\\"\\\\]", heredoc.group(2)):',
+     '                if False:'),
+    ('a quoted heredoc in text read as commands',
+     '                if not re.search(r"[\'\\"\\\\]", heredoc.group(2)):',
+     '                if True:'),
+    ('cat options read as file names',
+     '            paths = [f for f in names if not f.startswith("-")]',
+     '            paths = names'),
+    ('a $ ends a bare heredoc delimiter',
+     'r"|[^\\s;&|<>()\'\\"`\\\\])+)")',
+     'r"|[^\\s;&|<>()\'\\"`$\\\\])+)")'),
+    ('a quoted script read only when it starts with git',
+     '        if len(a.split()) > 1 and MAYBE_PUBLISH.search(a):',
+     '        if len(a.split()) > 1 and command_name(a.split()[0]) in HANDLED:'),
+    ('< FILE text not read',
+     '(?:cat\\s|<)',
+     '(?:cat\\s)'),
+    ('runner arguments searched only to the first program name',
+     '            simple_command(args[k:], dirs, parsed, depth)\n        if len(a.split()) > 1',
+     '            simple_command(args[k:], dirs, parsed, depth)\n            return\n        if len(a.split()) > 1'),
+    ('a built subcommand after a built name trusted',
+     '("push" in args or args and DYNAMIC.search(args[0])',
+     '("push" in args or False'),
+    ('a path argument taken for a built subcommand',
+     '\n                                 and "/" not in args[0]):',
+     '):'),
+    ('a $ inside single quotes read as a variable',
+     '        elif quote == "\'" and ch == "$":\n            ch = "\\4"  # literal, not a variable\n',
+     ''),
+    ('text from stdin trusted',
+     '            if "-" in names or not paths:',
+     '            if False:'),
+    ('text from a shell variable trusted',
+     '        if re.search(r"\\$[A-Za-z_{0-9@*#?!]", outside):',
+     '        if False:'),
+    ("a variable inside a substitution counted as the text's own",
+     '            outside = outside.replace(f"$({script})", "").replace(f"`{script}`", "")\n',
+     '            pass\n'),
+    ('pager/editor variables not read as commands',
+     '    if RUNS_COMMAND.match(name) and MAYBE_PUBLISH.search(value):',
+     '    if False:'),
+    ('pager assignments before a command not read',
+     '            runs_command(cmd[i], dirs, parsed, depth)\n',
+     ''),
+    ('git -c command values not read',
+     '            if len(value.split()) > 1 and MAYBE_PUBLISH.search(value):',
+     '            if False:'),
+    ('man page names read as a command',
+     '    elif word == "man":  # page names',
+     '    elif False:  # page names'),
+    ('man glued pager option not read',
+     '                elif a.startswith(opt) and a != opt:',
+     '                elif False:'),
+    ('man --pager value not read',
+     '            for opt in ("--pager", "--html", "-P", "-H"):',
+     '            for opt in ("-P", "-H"):'),
+    ('identity lines skipped in the message too',
+     '                    self.content(label, message)\n',
+     '                    self.content(label, message, IDENTITY)\n'),
+    ('an escaped \\$ read as a variable',
+     'out.append("\\4" if command.startswith("$", i + 1) else command[i:i + 2])',
+     'out.append(command[i:i + 2])'),
+    ('[[ / [ / test read as runners',
+     '"fgrep", "rg", "test", "[", "[["}',
+     '"fgrep", "rg"}'),
+    ("a recursive push's submodules not scanned",
+     '        if recurse and worktree:  # each submodule',
+     '        if False:  # each submodule'),
+    ('git -c push.recurseSubmodules ignored',
+     '                recurse = [f"--recurse-submodules={value}"]',
+     '                pass'),
+    ('push.recurseSubmodules setting ignored',
+     'run(["git", "config", "--get", "push.recurseSubmodules"], root)',
+     'None'),
+    ('--recurse-submodules=only not a push of submodules',
+     'value in ("on-demand", "only")',
+     'value in ("on-demand",)'),
+    ('--recurse-submodules=check taken for a push',
+     'return value if value in ("on-demand", "only") else None',
+     'return value'),
+    ('the remote not asked what it has',
+     '    have = remote_has(urls, root) if urls else None',
+     '    have = None'),
+    ('what the remote has not excluded',
+     '        return refs + (["--not", *have] if have else [])',
+     '        return refs'),
+    ('a leading space stripped from file names',
+     '            raw = git_bytes(listing_args[1:], root)  # not run(): its strip() eats a leading space\n            listing = raw.decode("utf-8", "replace") if raw is not None else None\n',
+     '            listing = run(listing_args, root)\n'),
+    ('unfetched remote commits fall back to stale tracking refs',
+     '            UNFETCHED.append(root)\n            have -= missing\n',
+     '            return None\n'),
+    ('the git fetch hint not shown',
+     '    if UNFETCHED:\n',
+     '    if False:\n'),
+    ('a glued short option value not read',
+     '            elif len(name) == 2 and a.startswith(name) and len(a) > 2:  # -fVALUE',
+     '            elif False:  # -fVALUE'),
+    ('--recurse-submodules=only still scans the superproject',
+     '            if recurse == "only":\n                return  # the superproject itself is not pushed\n',
+     ''),
+    ('a submodule pushed with only skips itself',
+     '                             ["--recurse-submodules=on-demand"], parsed, scan)',
+     '                             [f"--recurse-submodules={recurse}"], parsed, scan)'),
+    ('an abbreviated push option not spelled out (--mirr, --rep=URL)',
+     '            if name not in PUSH_LONG and len(hits) == 1:',
+     '            if False:'),
+    ("a push option's value in the next word not taken (-o --dry-run)",
+     '            if name in PUSH_VALUED and not eq and i < len(args):',
+     '            if False:'),
+    ('-on read as bundled flags (a dry run), not -o n',
+     '                if ch == "o":  # -o takes the rest of the word, or the next word',
+     '                if False:'),
+    ('--no-dry-run ignored after --dry-run',
+     '        elif o == "--no-dry-run":',
+     '        elif False:'),
+    ('the FIRST --recurse-submodules wins',
+     '        elif o.startswith("--recurse-submodules="):',
+     '        elif o.startswith("--recurse-submodules=") and value is None:'),
+    ('--no-recurse-submodules wins wherever it is',
+     '        if o == "--no-recurse-submodules":\n            value = "no"',
+     '        if o == "--no-recurse-submodules":\n            return None'),
+    ('--repo beats a positional repository',
+     '        named = words[:1] or [o[7:] for o in opts if o.startswith("--repo=")][-1:]',
+     '        named = [o[7:] for o in opts if o.startswith("--repo=")][-1:] or words[:1]'),
+    ("git -c push.recurseSubmodules read after the command's own flags",
+     '        opts, words = push_args(recurse + rest)',
+     '        opts, words = push_args(rest + recurse)'),
+    ('send-pack --stdin refs not counted',
+     '        refspecs = words[1:] + (["--mirror"] if "--mirror" in opts or "--stdin" in opts',
+     '        refspecs = words[1:] + (["--mirror"] if "--mirror" in opts'),
+    ('subtree push given a --dry-run it does not have',
+     '        if (sub == "subtree" or "--dry-run" not in rest) and "push" in words:',
+     '        if ("--dry-run" not in rest) and "push" in words:'),
+    ('git add --forc (an abbreviated --force) not a force-add',
+     '        if any(r.startswith("--f") and "--force".startswith(r) or',
+     '        if any(r == "--force" or'),
+    ("send-pack --remote's value read as the destination",
+     '               "--remote"}  # every push / send-pack option',
+     '               "--remote-x"}  # every push / send-pack option'),
+    ('a repository path trimmed (a folder name ending in a space)',
+     '    return os.fsdecode(out[:-1]) if out and out.endswith(b"\\n") else None',
+     '    return os.fsdecode(out).strip() if out and out.endswith(b"\\n") else None'),
+    ('GH_REPO / GH_HOST as a command prefix ignored',
+     '            gh_target(cmd[i], parsed)',
+     '            pass'),
+    ('GH_REPO / GH_HOST exported ignored',
+     '            gh_target(a, parsed)',
+     '            pass'),
+    ('GH_REPO / GH_HOST inherited from the environment ignored',
+     '            gh_target(f"{key}={os.environ.get(key, \'\')}", self)',
+     '            pass'),
+    ('GH_REPO from one reading of the command leaks into the other',
+     '        parsed.pushd, parsed.gh_env = [], inherited',
+     '        parsed.pushd = []'),
+    ('GH_HOST=github.com (the default) blocks',
+     ' and not (m.group(1) == "GH_HOST" and m.group(2) == "github.com"):',
+     ':'),
+    ('GH_REPO blocks even with the repository named by --repo',
+     '            and (parsed.gh_env == "GH_HOST" or not flag_values(rest, "--repo", "-R")):',
+     '            and True:'),
+    ('gh flags not read as gh reads them',
+     '    if not table:\n        return list(args)',
+     '    if True:\n        return list(args)'),
+    ('bundled gh short flags not split (-pw)',
+     '        elif a.startswith("-") and len(a) > 1:\n            k = 1',
+     '        elif False:\n            k = 1'),
+    ('a gh bool set false still counts (--public=false)',
+     '                if not eq or value not in PFLAG_FALSE:',
+     '                if True:'),
+    ("a gh short flag's value in the next word not taken (-pd TEXT)",
+     '                    if not glued and i < len(args):',
+     '                    if False:'),
+    ('a gh group flag before the subcommand read as the subcommand',
+     '        action, rest = split_action(args[1:], table)',
+     '        action, rest = (args[1:2] or [""])[0], args[2:]'),
+    ('gh repo edit --visibility read in lower case only',
+     'if "public" in (v.lower() for v in flag_values(rest, "--visibility")):\n            parsed.ops.append(("make-public"',
+     'if "public" in (v for v in flag_values(rest, "--visibility")):\n            parsed.ops.append(("make-public"'),
+    ('gh project edit --visibility PUBLIC passes',
+     'if "public" in (v.lower() for v in flag_values(rest, "--visibility")):\n            parsed.ops.append(("unseen"',
+     'if False:\n            parsed.ops.append(("unseen"'),
+    ('gh repo edit --add-topic not scanned',
+     '"--homepage", "-h", "--add-topic"),',
+     '"--homepage", "-h"),'),
+    ('gh repo rename not scanned',
+     '    elif group == "repo" and action == "rename":',
+     '    elif False:'),
+    ('gh repo fork --fork-name not scanned',
+     '    elif group == "repo" and action == "fork":',
+     '    elif False:'),
+    ('gh gist rename not scanned',
+     '    elif group == "gist" and action == "rename":',
+     '    elif False:'),
+    ('gh discussion not scanned',
+     '    elif group in ("issue", "pr", "discussion") and',
+     '    elif group in ("issue", "pr") and'),
+    ('gh label create / edit not scanned',
+     '    elif group == "label" and action in ("create", "edit"):',
+     '    elif False:'),
+    ('gh label clone not checked',
+     '    elif group == "label" and action == "clone":',
+     '    elif False:'),
+    ('labels cloned from a private repository pass',
+     '        if source and is_public(repo, d) and visibility(source, d) != "PUBLIC":',
+     '        if False:'),
+    ('gh project text not scanned',
+     '    elif group == "project":  # a project',
+     '    elif False:  # a project'),
+    ('text-anywhere waits for a visibility it cannot look up',
+     '        if not (texts or files) or kind == "text" and not is_public(repo, d):',
+     '        if not (texts or files) or not is_public(repo, d):'),
+    ('gh agent-task create not scanned',
+     '    elif group == "agent-task" and action == "create":',
+     '    elif False:'),
+    ('gh workflow run inputs not scanned',
+     '    elif group == "workflow" and action == "run":',
+     '    elif False:'),
+    ('gh skill publish not scanned',
+     '    elif group == "skill" and action == "publish" and "--dry-run" not in rest:',
+     '    elif False:'),
+    ('a gh alias set in the same command not recorded',
+     '            parsed.gh_aliases[named[0]] = ("!" if "--shell" in rest else "") + named[1]',
+     '            pass'),
+    ('gh alias import does not make later aliases unreadable',
+     '    elif group == "alias" and action == "import":',
+     '    elif False:'),
+    ("gh's configured aliases not read",
+     '            found[name] = value',
+     '            pass'),
+    ('a gh shell alias not walked',
+     '        nested(expansion[1:], dirs, parsed, depth)',
+     '        pass'),
+    ('a gh alias not walked as its expansion',
+     '            nested(shlex.join(["gh", *shlex.split(expansion), *extra]), dirs, parsed, depth)',
+     '            pass'),
+    ('GH_CONFIG_DIR does not make aliases unreadable',
+     "        parsed.gh_alias_opaque = True  # gh's aliases then come from another config",
+     '        pass'),
+    ('export GIT_DIR / GIT_WORK_TREE not a redirect',
+     '            if REDIRECTING_ENV.match(a):\n                parsed.redirected = True  # every later git',
+     '            if False:\n                parsed.redirected = True  # every later git'),
 ]
 
 # The case that caught each mutation on the last full run. It is tried first, which keeps CI
@@ -851,7 +2150,7 @@ CAUGHT_BY = {
     'gh api stdin body allowed': 'git push to a public repository',
     'gh api to a private repo scanned': 'gh api writing to a private repository',
     'gh api visibility change allowed': 'gh api flipping a repository public',
-    'gist -p missed': 'gh gist create -p <leaky file>',
+    'gist -p missed': "  (gh's help unreadable, so -p is read as written)",
     'gist description not scanned': 'a public gist with a private description',
     'git -C ignored': 'git -C <dir> push',
     'heredoc bodies read as commands': 'a heredoc written to script.sh is data',
@@ -909,7 +2208,6 @@ CAUGHT_BY = {
     'untracked files not scanned': 'an untracked file added in the same command',
     'variable cd trusted': 'a cd target built from a variable',
     'visibility change not detected': 'gh repo edit --visibility public',
-    'xargs/find not followed': 'xargs git push',
 }
 
 
@@ -933,10 +2231,30 @@ def main() -> int:
                 print(f"  FAIL  {desc}  ({detail})")
             failed += not ok
 
-        def mutate(mutation):
+        def unusable(mutation):
             label, old, new = mutation
             if source.count(old) != 1:
-                return f"  STALE     {label}  (target text found {source.count(old)} times)", True
+                return f"  STALE     {label}  (target text found {source.count(old)} times)"
+            try:
+                compile(source.replace(old, new), label, "exec")
+            except SyntaxError:
+                return f"  BROKEN    {label}  (the mutant does not compile)"
+            return None
+
+        if "--mutations" not in sys.argv[1:]:
+            bad = [line for line in map(unusable, MUTATIONS) if line]
+            for line in bad:
+                print(line)
+            print(f"{len(MUTATIONS)} mutations not run, only checked to still apply and compile "
+                  f"({len(bad)} do not). After changing the hook, run with --mutations.")
+            print(f"{len(CASES) - failed}/{len(CASES)} cases passed.")
+            return 1 if failed or bad else 0
+
+        def mutate(mutation):
+            label, old, new = mutation
+            problem = unusable(mutation)
+            if problem:
+                return problem, True
             red = [d for d, ok, _ in run_cases(base, source.replace(old, new), True,
                                                CAUGHT_BY.get(label)) if not ok]
             if red:
@@ -944,7 +2262,8 @@ def main() -> int:
             return f"  SURVIVED  {label}", True
 
         print(f"{len(MUTATIONS)} mutations (each must turn at least one case red):")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        workers = int(os.environ.get("PROBE_WORKERS", "4"))  # lower it on a small or hot machine
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             for line, bad in pool.map(mutate, MUTATIONS):
                 print(line)
                 failed += bad
