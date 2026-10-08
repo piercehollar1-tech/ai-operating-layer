@@ -204,7 +204,7 @@ def build(base: Path) -> None:
     case("  (push.recurseSubmodules=on-demand in the repository's config)", "git push origin main",
          super_cfg, 2, gh="BYURL")
     rewound = base / "repos" / "rewound-remote.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(rewound)], capture_output=True)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(rewound)], capture_output=True)
     r = repo()
     git(r, "remote", "set-url", "origin", str(rewound))
     git(r, "push", "-q", "origin", "main")
@@ -981,7 +981,7 @@ def build(base: Path) -> None:
     case("a push with --recurse-submodules=check pushes no submodule",
          "git push --recurse-submodules=check origin main", super_r, 0, gh="BYURL")
     in_sync = base / "repos" / "in-sync-remote.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(in_sync)], capture_output=True)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(in_sync)], capture_output=True)
     r = repo()
     git(r, "remote", "set-url", "origin", str(in_sync))
     (Path(r) / "draft.md").write_text(LEAK)
@@ -1206,6 +1206,7 @@ def run_cases(base: Path, source: str, stop_at_first_failure: bool = False,
             hooks[terms_text] = install(base, source, terms_text)
         env = {**os.environ, "PATH": f"{base / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
                "HOME": str(base / 'home'), "GH_MODE": c["gh"],
+               "XDG_CONFIG_HOME": str(base / 'home' / '.config'),  # CI runners set their own
                "GIT_ALLOW_PROTOCOL": "file",  # the hook's git never reaches the network here
                **c["env"]}
         try:
